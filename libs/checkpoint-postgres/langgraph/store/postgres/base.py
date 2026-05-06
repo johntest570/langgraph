@@ -10,7 +10,6 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import (
-    TYPE_CHECKING,
     Any,
     Generic,
     Literal,
@@ -44,9 +43,6 @@ from typing_extensions import TypedDict
 
 from langgraph.checkpoint.postgres import _ainternal as _ainternal
 from langgraph.checkpoint.postgres import _internal as _pg_internal
-
-if TYPE_CHECKING:
-    from langchain_core.embeddings import Embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -462,7 +458,7 @@ class BasePostgresStore(Generic[C]):
                     "vector_type", "vector"
                 )
 
-                # For hamming bit vectors, or “regular” vectors
+                # For hamming bit vectors, or "regular" vectors
                 if (
                     vector_type == "bit"
                     and cast(dict, self.index_config).get("distance_type") == "hamming"
@@ -483,7 +479,7 @@ class BasePostgresStore(Generic[C]):
                 ]
                 expanded_limit = (op.limit * vectors_per_doc_estimate * 2) + 1
 
-                # “sub_scored” does the main vector search
+                # "sub_scored" does the main vector search
                 # Then we do DISTINCT ON to drop duplicates if your store can have them
                 # Finally we limit & offset
                 vector_search_cte = f"""
@@ -673,9 +669,8 @@ class PostgresStore(BaseStore, BasePostgresStore[_pg_internal.Conn]):
             item = store.get(("users", "123"), "prefs")
         ```
 
-        Vector search using LangChain embeddings:
+        Vector search using embeddings:
         ```python
-        from langchain.embeddings import init_embeddings
         from langgraph.store.postgres import PostgresStore
 
         conn_string = "postgresql://user:pass@localhost:5432/dbname"
@@ -684,7 +679,7 @@ class PostgresStore(BaseStore, BasePostgresStore[_pg_internal.Conn]):
             conn_string,
             index={
                 "dims": 1536,
-                "embed": init_embeddings("openai:text-embedding-3-small"),
+                "embed": your_embeddings,
                 "fields": ["text"]  # specify which fields to embed. Default is the whole serialized value
             }
         ) as store:
@@ -1381,7 +1376,7 @@ def get_distance_operator(store: Any) -> tuple[str, str]:
 
 def _ensure_index_config(
     index_config: PostgresIndexConfig,
-) -> tuple[Embeddings | None, PostgresIndexConfig]:
+) -> tuple[Any, PostgresIndexConfig]:
     index_config = index_config.copy()
     tokenized: list[tuple[str, Literal["$"] | list[str]]] = []
     tot = 0
