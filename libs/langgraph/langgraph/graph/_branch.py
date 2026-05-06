@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable, Hashable, Sequence
 from inspect import (
     isfunction,
@@ -36,6 +37,59 @@ _Writer = Callable[
     [Sequence[str | Send], bool],
     Sequence[ChannelWriteEntry | Send],
 ]
+
+_MAX_INPUT_SIZE = 1_000_000  # 1 MB limit for serialized input
+_MAX_STRING_LENGTH = 100_000  # 100k characters for individual strings
+
+
+def _sanitize_and_validate_input(value: Any) -> Any:
+    """Sanitize and validate input before passing to path invocation.
+
+    Rejects non-serializable types, enforces a maximum input size,
+    and strips or rejects content that could represent prompt injection
+    (e.g., excessively long strings or binary blobs).
+    """
+    # Reject binary blobs
+    if isinstance(value, (bytes, bytearray)):
+        raise ValueError(
+            "Input validation failed: binary data is not allowed as branch input."
+        )
+
+    # Check serializability and size
+    try:
+        serialized = json.dumps(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Input validation failed: input is not JSON-serializable. {exc}"
+        ) from exc
+
+    if len(serialized) > _MAX_INPUT_SIZE:
+        raise ValueError(
+            f"Input validation failed: input size ({len(serialized)} bytes) "
+            f"exceeds maximum allowed size ({_MAX_INPUT_SIZE} bytes)."
+        )
+
+    # Check for excessively long strings within the value
+    _check_string_lengths(value)
+
+    return value
+
+
+def _check_string_lengths(value: Any) -> None:
+    """Recursively check that no string in the value exceeds the maximum length."""
+    if isinstance(value, str):
+        if len(value) > _MAX_STRING_LENGTH:
+            raise ValueError(
+                f"Input validation failed: a string field exceeds the maximum "
+                f"allowed length ({_MAX_STRING_LENGTH} characters). "
+                "This may indicate a prompt injection attempt."
+            )
+    elif isinstance(value, dict):
+        for v in value.values():
+            _check_string_lengths(v)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_string_lengths(item)
 
 
 def _get_branch_path_input_schema(
@@ -163,6 +217,7 @@ class BranchSpec(NamedTuple):
                 value = {**input, **value}
         else:
             value = input
+        value = _sanitize_and_validate_input(value)
         result = self.path.invoke(value, config)
         return self._finish(writer, input, result, config)
 
@@ -186,6 +241,7 @@ class BranchSpec(NamedTuple):
                 value = {**input, **value}
         else:
             value = input
+        value = _sanitize_and_validate_input(value)
         result = await self.path.ainvoke(value, config)
         return self._finish(writer, input, result, config)
 
