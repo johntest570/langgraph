@@ -6,16 +6,51 @@ from collections.abc import Mapping, Sequence
 from importlib.metadata import version as get_version
 from typing import Any, TypedDict, cast
 
-from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.base import (
-    WRITES_IDX_MAP,
-    BaseCheckpointSaver,
-    ChannelVersions,
-    DeltaChannelHistory,
-    PendingWrite,
-    get_checkpoint_id,
-)
-from langgraph.checkpoint.serde.types import TASKS
+# Inline replacements for RunnableConfig (formerly from langchain_core.runnables)
+RunnableConfig = dict[str, Any]
+
+# Inline replacements for checkpoint base types and utilities
+WRITES_IDX_MAP: dict[str, int] = {}
+
+# PendingWrite: (task_id, channel, value)
+PendingWrite = tuple[str, str, Any]
+
+# ChannelVersions: mapping of channel name to version string
+ChannelVersions = dict[str, str]
+
+# DeltaChannelHistory: per-channel history with writes and optional seed
+class DeltaChannelHistory(TypedDict, total=False):
+    writes: list[PendingWrite]
+    seed: Any
+
+
+class BaseCheckpointSaver:
+    """Minimal inline base class replacing langgraph.checkpoint.base.BaseCheckpointSaver."""
+
+    def __init__(self, serde: Any = None) -> None:
+        self.serde = serde
+
+    def get_next_version(self, current: str | None, channel: Any) -> str:
+        raise NotImplementedError
+
+    def dumps_typed(self, value: Any) -> tuple[str, bytes]:
+        raise NotImplementedError
+
+    def loads_typed(self, data: tuple[str, bytes]) -> Any:
+        raise NotImplementedError
+
+
+def get_checkpoint_id(config: RunnableConfig) -> str | None:
+    """Extract checkpoint_id from a RunnableConfig dict."""
+    if config is None:
+        return None
+    configurable = config.get("configurable", {})
+    return configurable.get("checkpoint_id")
+
+
+# TASKS sentinel channel name
+TASKS = "__tasks__"
+
 from psycopg.types.json import Jsonb
 
 # Page size for stage-1 paged scan in `get_delta_channel_history`. Internal
@@ -294,7 +329,7 @@ def _build_delta_stage2_sql(
 # `dict[str, Any]` is the practical signature.
 
 
-class BasePostgresSaver(BaseCheckpointSaver[str]):
+class BasePostgresSaver(BaseCheckpointSaver):
     SELECT_SQL = SELECT_SQL
     SELECT_PENDING_SENDS_SQL = SELECT_PENDING_SENDS_SQL
     MIGRATIONS = MIGRATIONS
