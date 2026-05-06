@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import enum
 import inspect
+import re
 import sys
+import unicodedata
 import warnings
 from collections.abc import (
     AsyncIterator,
@@ -62,6 +64,80 @@ try:
     from langchain_core.tracers._streaming import _StreamingCallbackHandler
 except ImportError:
     _StreamingCallbackHandler = None  # type: ignore
+
+
+# Maximum allowed length for string inputs to prevent oversized payload injection
+_MAX_INPUT_LENGTH = 100_000
+
+# Common prompt-injection patterns to reject
+_INJECTION_PATTERNS = re.compile(
+    r"(ignore\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)|"
+    r"disregard\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)|"
+    r"forget\s+(previous|prior|above|all)\s+(instructions?|prompts?|context)|"
+    r"you\s+are\s+now\s+|"
+    r"new\s+instructions?:|"
+    r"system\s*:\s*|"
+    r"<\s*system\s*>|"
+    r"\[\s*system\s*\]|"
+    r"###\s*instruction|"
+    r"prompt\s+injection|"
+    r"jailbreak)",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_and_validate_input(input: Any) -> Any:
+    """Sanitize and validate input before passing to LLM-invoking steps.
+
+    (1) Rejects None input.
+    (2) Enforces a maximum length on string inputs to prevent prompt injection
+        via oversized payloads.
+    (3) Strips null bytes and other non-printable control characters that could
+        be used for injection.
+    (4) Rejects inputs containing common prompt-injection patterns.
+
+    Args:
+        input: The input to sanitize and validate.
+
+    Returns:
+        The sanitized input.
+
+    Raises:
+        ValueError: If the input fails validation.
+    """
+    if input is None:
+        raise ValueError("Input must not be None.")
+
+    if isinstance(input, str):
+        # Strip null bytes and non-printable control characters (except common whitespace)
+        sanitized = "".join(
+            ch
+            for ch in input
+            if ch in ("\t", "\n", "\r") or (unicodedata.category(ch) != "Cc")
+        )
+        # Remove null bytes explicitly
+        sanitized = sanitized.replace("\x00", "")
+
+        if len(sanitized) > _MAX_INPUT_LENGTH:
+            raise ValueError(
+                f"Input length {len(sanitized)} exceeds maximum allowed length "
+                f"of {_MAX_INPUT_LENGTH} characters."
+            )
+
+        if _INJECTION_PATTERNS.search(sanitized):
+            raise ValueError(
+                "Input contains potential prompt-injection patterns and has been rejected."
+            )
+
+        return sanitized
+
+    if isinstance(input, dict):
+        return {k: _sanitize_and_validate_input(v) for k, v in input.items()}
+
+    if isinstance(input, list):
+        return [_sanitize_and_validate_input(item) for item in input]
+
+    return input
 
 
 def _set_config_context(
@@ -813,6 +889,8 @@ class RunnableSeq(Runnable):
     ) -> AsyncIterator[Any]:
         if config is None:
             config = ensure_config()
+        # sanitize and validate input before passing to any LLM-invoking step
+        input = _sanitize_and_validate_input(input)
         # setup callbacks
         callback_manager = get_async_callback_manager_for_config(config)
         # start the root run
