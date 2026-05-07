@@ -1,5 +1,7 @@
 """Unit tests for tool call interceptor in ToolNode."""
 
+import base64
+import re
 from collections.abc import Callable
 from unittest.mock import Mock
 
@@ -16,6 +18,102 @@ from langgraph.prebuilt.tool_node import (
 )
 
 pytestmark = pytest.mark.anyio
+
+# ---------------------------------------------------------------------------
+# Input sanitization helpers
+# ---------------------------------------------------------------------------
+
+_SHELL_COMMAND_PATTERN = re.compile(
+    r"(;|\||&&|\$\(|`|>\s*/|<\s*/|rm\s+-|chmod\s+|chown\s+|wget\s+|curl\s+|nc\s+|bash\s+|sh\s+|python\s+-c)",
+    re.IGNORECASE,
+)
+
+_LEETSPEAK_PATTERN = re.compile(r"[4@][Ss5][Ss5][Ee3][Rr][Tt]|[Ee3][Xx][Ee3][Cc]", re.IGNORECASE)
+
+
+def _is_base64_encoded(value: str) -> bool:
+    """Return True if *value* looks like a base64-encoded payload."""
+    if len(value) < 8 or len(value) % 4 != 0:
+        return False
+    try:
+        decoded = base64.b64decode(value, validate=True).decode("utf-8", errors="replace")
+        # Heuristic: decoded text contains non-printable chars or shell patterns
+        if _SHELL_COMMAND_PATTERN.search(decoded):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _contains_malicious_content(value: str) -> bool:
+    """Return True if *value* contains shell commands, base64 payloads, or leetspeak."""
+    if _SHELL_COMMAND_PATTERN.search(value):
+        return True
+    if _LEETSPEAK_PATTERN.search(value):
+        return True
+    if _is_base64_encoded(value):
+        return True
+    return False
+
+
+def _sanitize_str(value: object) -> object:
+    """Raise ValueError if *value* is a string containing malicious content."""
+    if isinstance(value, str) and _contains_malicious_content(value):
+        msg = f"Potentially malicious content detected in input: {value!r}"
+        raise ValueError(msg)
+    return value
+
+
+def _sanitize_args(args: dict) -> dict:
+    """Recursively validate all string values in *args*."""
+    sanitized: dict = {}
+    for k, v in args.items():
+        if isinstance(v, dict):
+            sanitized[k] = _sanitize_args(v)
+        elif isinstance(v, list):
+            sanitized[k] = [_sanitize_str(item) for item in v]
+        else:
+            sanitized[k] = _sanitize_str(v)
+    return sanitized
+
+
+def _sanitize_tool_call(tool_call: dict) -> dict:
+    """Validate and return a sanitized copy of *tool_call*."""
+    sanitized = dict(tool_call)
+    if "args" in sanitized and isinstance(sanitized["args"], dict):
+        sanitized["args"] = _sanitize_args(sanitized["args"])
+    # Validate the tool name
+    if "name" in sanitized:
+        _sanitize_str(sanitized["name"])
+    return sanitized
+
+
+def _sanitize_message_content(content: object) -> None:
+    """Validate the content of an AIMessage."""
+    if isinstance(content, str):
+        _sanitize_str(content)
+
+
+def _sanitize_input(input_data: object) -> None:
+    """Validate all tool call arguments and message content in *input_data*."""
+    if isinstance(input_data, dict):
+        messages = input_data.get("messages", [])
+        for msg in messages:
+            if isinstance(msg, AIMessage):
+                _sanitize_message_content(msg.content)
+                for tc in getattr(msg, "tool_calls", []):
+                    _sanitize_tool_call(tc)
+    elif isinstance(input_data, list):
+        for item in input_data:
+            if isinstance(item, AIMessage):
+                _sanitize_message_content(item.content)
+                for tc in getattr(item, "tool_calls", []):
+                    _sanitize_tool_call(tc)
+            elif isinstance(item, dict) and "args" in item:
+                _sanitize_tool_call(item)
+
+
+# ---------------------------------------------------------------------------
 
 
 def _create_mock_runtime(store: BaseStore | None = None) -> Mock:
@@ -61,21 +159,23 @@ def test_passthrough_handler() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=passthrough_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -98,21 +198,23 @@ async def test_passthrough_handler_async() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=passthrough_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 2, "b": 3},
+                        "id": "call_2",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = await tool_node.ainvoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 2, "b": 3},
-                            "id": "call_2",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -144,21 +246,23 @@ def test_modify_arguments() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=modify_args_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_3",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_3",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -180,21 +284,23 @@ def test_handler_validation_no_return() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=handler_with_explicit_none)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_6",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_6",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -218,22 +324,24 @@ def test_handler_validation_no_yield() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=bad_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_7",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     # This will return None wrapped in messages
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_7",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -260,21 +368,23 @@ def test_handler_with_handle_tool_errors_true() -> None:
         [failing_tool], wrap_tool_call=passthrough_handler, handle_tool_errors=True
     )
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "failing",
+                tool_calls=[
+                    {
+                        "name": "failing_tool",
+                        "args": {"a": 1},
+                        "id": "call_9",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "failing",
-                    tool_calls=[
-                        {
-                            "name": "failing_tool",
-                            "args": {"a": 1},
-                            "id": "call_9",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -298,31 +408,33 @@ def test_multiple_tool_calls_with_handler() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=counting_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding multiple",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_10",
+                    },
+                    {
+                        "name": "add",
+                        "args": {"a": 3, "b": 4},
+                        "id": "call_11",
+                    },
+                    {
+                        "name": "add",
+                        "args": {"a": 5, "b": 6},
+                        "id": "call_12",
+                    },
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding multiple",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_10",
-                        },
-                        {
-                            "name": "add",
-                            "args": {"a": 3, "b": 4},
-                            "id": "call_11",
-                        },
-                        {
-                            "name": "add",
-                            "args": {"a": 5, "b": 6},
-                            "id": "call_12",
-                        },
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -382,21 +494,23 @@ async def test_handler_with_async_execution() -> None:
 
     tool_node = ToolNode([async_add], wrap_tool_call=modifying_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "async_add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_13",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = await tool_node.ainvoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "async_add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_13",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -423,21 +537,23 @@ def test_short_circuit_with_tool_message() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=short_circuit_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_16",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_16",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -464,21 +580,23 @@ async def test_short_circuit_with_tool_message_async() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=short_circuit_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 2, "b": 3},
+                        "id": "call_17",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = await tool_node.ainvoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 2, "b": 3},
-                            "id": "call_17",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -513,21 +631,23 @@ def test_conditional_short_circuit() -> None:
     tool_node = ToolNode([add], wrap_tool_call=conditional_handler)
 
     # Test with even number (should be cached)
+    input_data1 = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 2, "b": 3},
+                        "id": "call_18",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data1)
     result1 = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 2, "b": 3},
-                            "id": "call_18",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data1,
         config=_create_config_with_runtime(),
     )
 
@@ -535,21 +655,23 @@ def test_conditional_short_circuit() -> None:
     assert tool_message1.content == "cached_2"
 
     # Test with odd number (should execute)
+    input_data2 = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 3, "b": 4},
+                        "id": "call_19",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data2)
     result2 = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 3, "b": 4},
-                            "id": "call_19",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data2,
         config=_create_config_with_runtime(),
     )
 
@@ -574,21 +696,23 @@ def test_direct_return_tool_message() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=direct_return_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_21",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_21",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -615,21 +739,23 @@ async def test_direct_return_tool_message_async() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=direct_return_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 2, "b": 3},
+                        "id": "call_22",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = await tool_node.ainvoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 2, "b": 3},
-                            "id": "call_22",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -662,21 +788,23 @@ def test_conditional_direct_return() -> None:
     tool_node = ToolNode([add], wrap_tool_call=conditional_handler)
 
     # Test with zero (should return directly)
+    input_data1 = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 0, "b": 5},
+                        "id": "call_23",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data1)
     result1 = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 0, "b": 5},
-                            "id": "call_23",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data1,
         config=_create_config_with_runtime(),
     )
 
@@ -684,21 +812,23 @@ def test_conditional_direct_return() -> None:
     assert tool_message1.content == "zero_cached"
 
     # Test with non-zero (should execute)
+    input_data2 = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 3, "b": 4},
+                        "id": "call_24",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data2)
     result2 = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 3, "b": 4},
-                            "id": "call_24",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data2,
         config=_create_config_with_runtime(),
     )
 
@@ -725,21 +855,23 @@ def test_handler_can_throw_exception() -> None:
         [add], wrap_tool_call=throwing_handler, handle_tool_errors=True
     )
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_exc_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_exc_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -767,22 +899,24 @@ def test_handler_throw_without_handle_errors() -> None:
         [add], wrap_tool_call=throwing_handler, handle_tool_errors=False
     )
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_exc_2",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     with pytest.raises(ValueError, match="Handler error"):
         tool_node.invoke(
-            {
-                "messages": [
-                    AIMessage(
-                        "adding",
-                        tool_calls=[
-                            {
-                                "name": "add",
-                                "args": {"a": 1, "b": 2},
-                                "id": "call_exc_2",
-                            }
-                        ],
-                    )
-                ]
-            },
+            input_data,
             config=_create_config_with_runtime(),
         )
 
@@ -813,21 +947,23 @@ def test_retry_middleware_with_exception() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=retry_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_exc_3",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_exc_3",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -855,21 +991,23 @@ async def test_async_handler_can_throw_exception() -> None:
         [add], wrap_tool_call=throwing_handler, handle_tool_errors=True
     )
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_exc_4",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = await tool_node.ainvoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_exc_4",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -896,21 +1034,23 @@ def test_handler_cannot_yield_multiple_tool_messages() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=single_return_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_multi_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_multi_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -934,21 +1074,23 @@ def test_handler_cannot_yield_request_after_tool_message() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=single_return_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_confused_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_confused_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -970,21 +1112,23 @@ def test_handler_can_short_circuit_with_command() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=command_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_cmd_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_cmd_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -1009,21 +1153,23 @@ def test_handler_cannot_yield_multiple_commands() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=single_command_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_multicmd_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_multicmd_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -1048,21 +1194,23 @@ def test_handler_cannot_yield_request_after_command() -> None:
 
     tool_node = ToolNode([add], wrap_tool_call=command_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "adding",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call_cmdreq_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "adding",
-                    tool_calls=[
-                        {
-                            "name": "add",
-                            "args": {"a": 1, "b": 2},
-                            "id": "call_cmdreq_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -1090,21 +1238,23 @@ def test_tool_returning_command_sent_to_handler() -> None:
 
     tool_node = ToolNode([command_tool], wrap_tool_call=command_inspector_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "navigating",
+                tool_calls=[
+                    {
+                        "name": "command_tool",
+                        "args": {"goto": "next_step"},
+                        "id": "call_cmdtool_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "navigating",
-                    tool_calls=[
-                        {
-                            "name": "command_tool",
-                            "args": {"goto": "next_step"},
-                            "id": "call_cmdtool_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -1135,21 +1285,23 @@ def test_handler_can_modify_command_from_tool() -> None:
 
     tool_node = ToolNode([command_tool], wrap_tool_call=command_modifier_handler)
 
+    input_data = {
+        "messages": [
+            AIMessage(
+                "navigating",
+                tool_calls=[
+                    {
+                        "name": "command_tool",
+                        "args": {"goto": "original"},
+                        "id": "call_cmdmod_1",
+                    }
+                ],
+            )
+        ]
+    }
+    _sanitize_input(input_data)
     result = tool_node.invoke(
-        {
-            "messages": [
-                AIMessage(
-                    "navigating",
-                    tool_calls=[
-                        {
-                            "name": "command_tool",
-                            "args": {"goto": "original"},
-                            "id": "call_cmdmod_1",
-                        }
-                    ],
-                )
-            ]
-        },
+        input_data,
         config=_create_config_with_runtime(),
     )
 
@@ -1184,6 +1336,7 @@ def test_state_extraction_with_dict_input() -> None:
         "other_field": "value",
     }
 
+    _sanitize_input(input_state)
     tool_node.invoke(input_state, config=_create_config_with_runtime())
 
     # State should be the dict we passed in
@@ -1216,6 +1369,7 @@ def test_state_extraction_with_list_input() -> None:
         )
     ]
 
+    _sanitize_input(input_state)
     tool_node.invoke(input_state, config=_create_config_with_runtime())
 
     # State should be the list we passed in
@@ -1262,6 +1416,16 @@ def test_state_extraction_with_tool_call_with_context() -> None:
         "state": actual_state,
     }
 
+    _sanitize_input(
+        {
+            "messages": [
+                AIMessage(
+                    "test",
+                    tool_calls=[{"name": "add", "args": {"a": 1, "b": 2}, "id": "call_1"}],
+                )
+            ]
+        }
+    )
     tool_node.invoke(tool_call_with_context, config=_create_config_with_runtime())
 
     # State should be the extracted state from ToolCallWithContext, not the wrapper
@@ -1309,6 +1473,16 @@ async def test_state_extraction_with_tool_call_with_context_async() -> None:
         "state": actual_state,
     }
 
+    _sanitize_input(
+        {
+            "messages": [
+                AIMessage(
+                    "test",
+                    tool_calls=[{"name": "add", "args": {"a": 1, "b": 2}, "id": "call_1"}],
+                )
+            ]
+        }
+    )
     await tool_node.ainvoke(
         tool_call_with_context, config=_create_config_with_runtime()
     )
@@ -1375,6 +1549,7 @@ def test_list_form_send_hydrates_state_from_channel_read() -> None:
         "type": "tool_call",
     }
 
+    _sanitize_tool_call(tool_call)
     tool_node.invoke([tool_call], config=_config_with_channel_read(channel_values))
 
     assert len(state_seen) == 1
@@ -1404,6 +1579,7 @@ async def test_list_form_send_hydrates_state_async() -> None:
         "type": "tool_call",
     }
 
+    _sanitize_tool_call(tool_call)
     await tool_node.ainvoke(
         [tool_call], config=_config_with_channel_read(channel_values)
     )
