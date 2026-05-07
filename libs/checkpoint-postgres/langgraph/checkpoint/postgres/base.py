@@ -1,57 +1,27 @@
 from __future__ import annotations
 
-import random
+import hashlib
+import logging
+import os
 import warnings
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from importlib.metadata import version as get_version
 from typing import Any, TypedDict, cast
 
-# Inline replacements for RunnableConfig (formerly from langchain_core.runnables)
-RunnableConfig = dict[str, Any]
-
-# Inline replacements for checkpoint base types and utilities
-WRITES_IDX_MAP: dict[str, int] = {}
-
-# PendingWrite: (task_id, channel, value)
-PendingWrite = tuple[str, str, Any]
-
-# ChannelVersions: mapping of channel name to version string
-ChannelVersions = dict[str, str]
-
-# DeltaChannelHistory: per-channel history with writes and optional seed
-class DeltaChannelHistory(TypedDict, total=False):
-    writes: list[PendingWrite]
-    seed: Any
-
-
-class BaseCheckpointSaver:
-    """Minimal inline base class replacing langgraph.checkpoint.base.BaseCheckpointSaver."""
-
-    def __init__(self, serde: Any = None) -> None:
-        self.serde = serde
-
-    def get_next_version(self, current: str | None, channel: Any) -> str:
-        raise NotImplementedError
-
-    def dumps_typed(self, value: Any) -> tuple[str, bytes]:
-        raise NotImplementedError
-
-    def loads_typed(self, data: tuple[str, bytes]) -> Any:
-        raise NotImplementedError
-
-
-def get_checkpoint_id(config: RunnableConfig) -> str | None:
-    """Extract checkpoint_id from a RunnableConfig dict."""
-    if config is None:
-        return None
-    configurable = config.get("configurable", {})
-    return configurable.get("checkpoint_id")
-
-
-# TASKS sentinel channel name
-TASKS = "__tasks__"
-
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import (
+    WRITES_IDX_MAP,
+    BaseCheckpointSaver,
+    ChannelVersions,
+    DeltaChannelHistory,
+    PendingWrite,
+    get_checkpoint_id,
+)
+from langgraph.checkpoint.serde.types import TASKS
 from psycopg.types.json import Jsonb
+
+logger = logging.getLogger(__name__)
 
 # Page size for stage-1 paged scan in `get_delta_channel_history`. Internal
 # constant — exposing this as a kwarg is left as a follow-up.
@@ -87,6 +57,7 @@ MIGRATIONS = [
     type TEXT,
     checkpoint JSONB NOT NULL,
     metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
 );""",
     """CREATE TABLE IF NOT EXISTS checkpoint_blobs (
@@ -170,21 +141,15 @@ UPSERT_CHECKPOINT_BLOBS_SQL = """
 """
 
 UPSERT_CHECKPOINTS_SQL = """
-    INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id)
-    DO UPDATE SET
-        checkpoint = EXCLUDED.checkpoint,
-        metadata = EXCLUDED.metadata;
+    INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata, created_at)
+    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id) DO NOTHING;
 """
 
 UPSERT_CHECKPOINT_WRITES_SQL = """
     INSERT INTO checkpoint_writes (thread_id, checkpoint_ns, checkpoint_id, task_id, task_path, idx, channel, type, blob)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id, task_id, idx) DO UPDATE SET
-        channel = EXCLUDED.channel,
-        type = EXCLUDED.type,
-        blob = EXCLUDED.blob;
+    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id, task_id, idx) DO NOTHING;
 """
 
 INSERT_CHECKPOINT_WRITES_SQL = """
@@ -329,7 +294,7 @@ def _build_delta_stage2_sql(
 # `dict[str, Any]` is the practical signature.
 
 
-class BasePostgresSaver(BaseCheckpointSaver):
+class BasePostgresSaver(BaseCheckpointSaver[str]):
     SELECT_SQL = SELECT_SQL
     SELECT_PENDING_SENDS_SQL = SELECT_PENDING_SENDS_SQL
     MIGRATIONS = MIGRATIONS
@@ -583,8 +548,17 @@ class BasePostgresSaver(BaseCheckpointSaver):
         else:
             current_v = int(current.split(".")[0])
         next_v = current_v + 1
-        next_h = random.random()
-        return f"{next_v:032}.{next_h:016}"
+        next_h = hashlib.sha256(os.urandom(32)).hexdigest()
+        logger.debug(
+            "checkpoint_version_generated",
+            extra={
+                "event": "get_next_version",
+                "current_v": current_v,
+                "next_v": next_v,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return f"{next_v:032}.{next_h}"
 
     def _search_where(
         self,
