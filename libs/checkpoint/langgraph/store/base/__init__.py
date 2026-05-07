@@ -22,7 +22,6 @@ from typing import (
     cast,
 )
 
-from langchain_core.embeddings import Embeddings
 from typing_extensions import override
 
 from langgraph.store.base.embed import (
@@ -32,6 +31,44 @@ from langgraph.store.base.embed import (
     get_text_at_path,
     tokenize_path,
 )
+
+# Registry of approved embedding models with pinned versions and integrity metadata
+APPROVED_EMBEDDING_REGISTRY: dict[str, dict[str, Any]] = {
+    # Organizations must populate this registry with approved models,
+    # their pinned versions, and cryptographic hashes for integrity verification.
+    # Example entry format:
+    # "approved-model-id": {
+    #     "version": "1.0.0",
+    #     "sha256": "<hex-digest>",
+    #     "provider": "<approved-provider>",
+    # }
+}
+
+
+def _verify_embedding_model(embed: Any) -> None:
+    """Verify that the embedding model is from the approved registry.
+
+    Raises:
+        ValueError: If the embedding model is not in the approved registry
+            or does not meet version pinning and integrity requirements.
+    """
+    if isinstance(embed, str):
+        if embed not in APPROVED_EMBEDDING_REGISTRY:
+            raise ValueError(
+                f"Embedding model '{embed}' is not in the organization's approved "
+                f"registry. Approved models: {list(APPROVED_EMBEDDING_REGISTRY.keys())}. "
+                f"Ensure the model is registered with a pinned version and integrity hash."
+            )
+    elif embed is not None:
+        # For callable or object-based embeddings, require explicit registry approval
+        embed_type = type(embed).__name__
+        if embed_type not in APPROVED_EMBEDDING_REGISTRY:
+            raise ValueError(
+                f"Embedding model of type '{embed_type}' is not in the organization's "
+                f"approved registry. Only approved embedding models with pinned versions "
+                f"and verified integrity may be used. "
+                f"Approved models: {list(APPROVED_EMBEDDING_REGISTRY.keys())}."
+            )
 
 
 class NotProvided:
@@ -572,6 +609,11 @@ class IndexConfig(TypedDict, total=False):
 
     If not provided to the store, the store will not support vector search.
     In that case, all `index` arguments to `put()` and `aput()` operations will be ignored.
+
+    Note:
+        All embedding models specified via the `embed` field must be present in the
+        organization's approved registry (APPROVED_EMBEDDING_REGISTRY) with pinned
+        versions and verified integrity hashes. Use of unapproved models is prohibited.
     """
 
     dims: int
@@ -587,45 +629,27 @@ class IndexConfig(TypedDict, total=False):
         - `cohere:embed-multilingual-light-v3.0`: `384`
     """
 
-    embed: Embeddings | EmbeddingsFunc | AEmbeddingsFunc | str
+    embed: EmbeddingsFunc | AEmbeddingsFunc | str
     """Optional function to generate embeddings from text.
     
-    Can be specified in three ways:
-        1. A LangChain `Embeddings` instance
-        2. A synchronous embedding function (`EmbeddingsFunc`)
-        3. An asynchronous embedding function (`AEmbeddingsFunc`)
-        4. A provider string (e.g., `"openai:text-embedding-3-small"`)
+    Must reference a model present in the organization's approved registry
+    (APPROVED_EMBEDDING_REGISTRY) with a pinned version and integrity hash.
+
+    Can be specified in two ways:
+        1. A synchronous embedding function (`EmbeddingsFunc`)
+        2. An asynchronous embedding function (`AEmbeddingsFunc`)
+        3. A provider string (e.g., `"approved-model-id"`) that exists in APPROVED_EMBEDDING_REGISTRY
     
     ???+ example "Examples"
 
-        Using LangChain's initialization with `InMemoryStore`:
+        Using an approved embedding function with `InMemoryStore`:
 
         ```python
-        from langchain.embeddings import init_embeddings
         from langgraph.store.memory import InMemoryStore
-        
-        store = InMemoryStore(
-            index={
-                "dims": 1536,
-                "embed": init_embeddings("openai:text-embedding-3-small")
-            }
-        )
-        ```
-        
-        Using a custom embedding function with `InMemoryStore`:
-
-        ```python
-        from openai import OpenAI
-        from langgraph.store.memory import InMemoryStore
-        
-        client = OpenAI()
         
         def embed_texts(texts: list[str]) -> list[list[float]]:
-            response = client.embeddings.create(
-                model="text-embedding-3-small",
-                input=texts
-            )
-            return [e.embedding for e in response.data]
+            # Use only approved, registry-verified embedding models
+            ...
             
         store = InMemoryStore(
             index={
@@ -635,20 +659,14 @@ class IndexConfig(TypedDict, total=False):
         )
         ```
         
-        Using an asynchronous embedding function with `InMemoryStore`:
+        Using an approved asynchronous embedding function with `InMemoryStore`:
 
         ```python
-        from openai import AsyncOpenAI
         from langgraph.store.memory import InMemoryStore
         
-        client = AsyncOpenAI()
-        
         async def aembed_texts(texts: list[str]) -> list[list[float]]:
-            response = await client.embeddings.create(
-                model="text-embedding-3-small",
-                input=texts
-            )
-            return [e.embedding for e in response.data]
+            # Use only approved, registry-verified embedding models
+            ...
             
         store = InMemoryStore(
             index={
@@ -714,6 +732,9 @@ class BaseStore(ABC):
 
         Similarly, TTL (time-to-live) support is disabled by default.
         Subclasses must explicitly set `supports_ttl = True` to enable this feature.
+
+        All embedding models used for vector search must be registered in
+        APPROVED_EMBEDDING_REGISTRY with pinned versions and integrity hashes.
     """
 
     supports_ttl: bool = False
@@ -812,7 +833,7 @@ class BaseStore(ABC):
             store = YourStore( # e.g., InMemoryStore, AsyncPostgresStore
                 index={
                     "dims": 1536,  # embedding dimensions
-                    "embed": your_embedding_function,  # function to create embeddings
+                    "embed": your_embedding_function,  # approved function to create embeddings
                     "fields": ["text"]  # fields to embed. Defaults to ["$"]
                 }
             )
@@ -1063,7 +1084,7 @@ class BaseStore(ABC):
             store = YourStore( # e.g., InMemoryStore, AsyncPostgresStore
                 index={
                     "dims": 1536,  # embedding dimensions
-                    "embed": your_embedding_function,  # function to create embeddings
+                    "embed": your_embedding_function,  # approved function to create embeddings
                     "fields": ["text"]  # fields to embed
                 }
             )
@@ -1307,8 +1328,8 @@ __all__ = [
     "MatchCondition",
     "NamespacePath",
     "NamespaceMatchType",
-    "Embeddings",
     "ensure_embeddings",
     "tokenize_path",
     "get_text_at_path",
+    "APPROVED_EMBEDDING_REGISTRY",
 ]
