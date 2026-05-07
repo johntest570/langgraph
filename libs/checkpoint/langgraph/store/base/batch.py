@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import functools
+import hashlib
+import json
+import logging
 import weakref
 from collections.abc import Callable, Iterable
 from typing import Any, Literal, TypeVar
@@ -27,7 +31,103 @@ from langgraph.store.base import (
     _validate_namespace,
 )
 
+logger = logging.getLogger(__name__)
+
 F = TypeVar("F", bound=Callable)
+
+_HITL_DELETE_APPROVER: Callable[[tuple[str, ...], str], bool] | None = None
+
+
+def set_delete_approver(approver: Callable[[tuple[str, ...], str], bool] | None) -> None:
+    """Set a Human-in-the-Loop approver callback for delete operations.
+
+    The approver callable receives (namespace, key) and must return True to allow
+    the delete, or False/raise to deny it.
+    """
+    global _HITL_DELETE_APPROVER
+    _HITL_DELETE_APPROVER = approver
+
+
+def _require_delete_approval(namespace: tuple[str, ...], key: str) -> None:
+    """Enforce HITL approval for delete operations."""
+    approver = _HITL_DELETE_APPROVER
+    if approver is None:
+        raise PermissionError(
+            f"Delete operation on namespace={namespace!r}, key={key!r} requires "
+            "Human-in-the-Loop approval. Register an approver via "
+            "`set_delete_approver(callable)` before performing delete operations."
+        )
+    approved = approver(namespace, key)
+    if not approved:
+        _audit_log(
+            action="delete_denied",
+            namespace=namespace,
+            key=key,
+            details="HITL approver denied the delete operation.",
+        )
+        raise PermissionError(
+            f"Delete operation on namespace={namespace!r}, key={key!r} was denied "
+            "by the Human-in-the-Loop approver."
+        )
+    _audit_log(
+        action="delete_approved",
+        namespace=namespace,
+        key=key,
+        details="HITL approver approved the delete operation.",
+    )
+
+
+def _audit_log(
+    action: str,
+    namespace: tuple[str, ...] | None = None,
+    key: str | None = None,
+    ops: list[Op] | None = None,
+    results: list[Any] | None = None,
+    error: Exception | None = None,
+    details: str | None = None,
+) -> None:
+    """Write a structured audit record to the logger."""
+    record: dict[str, Any] = {
+        "audit": True,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "action": action,
+    }
+    if namespace is not None:
+        record["namespace"] = list(namespace)
+    if key is not None:
+        record["key"] = key
+    if ops is not None:
+        try:
+            ops_repr = [repr(op) for op in ops]
+            ops_hash = hashlib.sha256(
+                json.dumps(ops_repr, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            record["ops_count"] = len(ops)
+            record["ops_hash"] = ops_hash
+            record["ops_types"] = [type(op).__name__ for op in ops]
+        except Exception:
+            record["ops_repr_error"] = "failed to serialize ops"
+    if results is not None:
+        try:
+            results_repr = [repr(r) for r in results]
+            results_hash = hashlib.sha256(
+                json.dumps(results_repr, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            record["results_count"] = len(results)
+            record["results_hash"] = results_hash
+        except Exception:
+            record["results_repr_error"] = "failed to serialize results"
+    if error is not None:
+        record["error"] = type(error).__name__
+        record["error_message"] = str(error)
+    if details is not None:
+        record["details"] = details
+    try:
+        logger.info("AUDIT: %s", json.dumps(record, default=str))
+    except Exception as log_exc:
+        # Logging failure must not be silent — emit to stderr via fallback
+        import sys
+        print(f"AUDIT LOG FAILURE: {log_exc!r} | record={record!r}", file=sys.stderr)
 
 
 def _check_loop(func: F) -> F:
@@ -155,9 +255,22 @@ class AsyncBatchedBaseStore(BaseStore):
         namespace: tuple[str, ...],
         key: str,
     ) -> None:
+        _audit_log(
+            action="delete_requested",
+            namespace=namespace,
+            key=key,
+            details="HITL approval check initiated for adelete.",
+        )
+        _require_delete_approval(namespace, key)
         self._ensure_task()
         fut = self._loop.create_future()
         self._aqueue.put_nowait((fut, PutOp(namespace, key, None)))
+        _audit_log(
+            action="delete_enqueued",
+            namespace=namespace,
+            key=key,
+            details="Delete operation enqueued after HITL approval.",
+        )
         return await fut
 
     async def alist_namespaces(
@@ -254,6 +367,13 @@ class AsyncBatchedBaseStore(BaseStore):
         namespace: tuple[str, ...],
         key: str,
     ) -> None:
+        _audit_log(
+            action="delete_requested",
+            namespace=namespace,
+            key=key,
+            details="HITL approval check initiated for delete.",
+        )
+        _require_delete_approval(namespace, key)
         asyncio.run_coroutine_threadsafe(
             self.adelete(namespace, key=key), self._loop
         ).result()
@@ -350,9 +470,21 @@ async def _run(
                 # action each operation
                 try:
                     listen, dedupped = _dedupe_ops(values)
+                    _audit_log(
+                        action="batch_execute_start",
+                        ops=dedupped,
+                        details=f"Executing batch of {len(dedupped)} deduped ops from {len(values)} total ops.",
+                    )
                     results = await s.abatch(dedupped)
                     if listen is not None:
                         results = [results[ix] for ix in listen]
+
+                    _audit_log(
+                        action="batch_execute_success",
+                        ops=dedupped,
+                        results=results,
+                        details=f"Batch execution succeeded with {len(results)} results.",
+                    )
 
                     # set the results of each operation
                     for fut, result in zip(futs, results, strict=False):
@@ -360,6 +492,12 @@ async def _run(
                         if not fut.done():
                             fut.set_result(result)
                 except Exception as e:
+                    _audit_log(
+                        action="batch_execute_error",
+                        ops=dedupped,
+                        error=e,
+                        details="Batch execution raised an exception; propagating to futures.",
+                    )
                     for fut in futs:
                         # guard against future being done (e.g. cancelled)
                         if not fut.done():
