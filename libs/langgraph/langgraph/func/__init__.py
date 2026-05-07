@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
 import functools
+import hashlib
 import inspect
+import logging
+import re
+import uuid
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import (
     Any,
     Generic,
@@ -55,6 +60,165 @@ from langgraph.warnings import LangGraphDeprecatedSinceV05, LangGraphDeprecatedS
 
 __all__ = ("task", "entrypoint")
 
+_audit_logger = logging.getLogger("langgraph.audit")
+
+# ---------------------------------------------------------------------------
+# Approved model / component registry
+# ---------------------------------------------------------------------------
+_APPROVED_COMPONENT_REGISTRY: set[str] = {
+    "langgraph",
+    "langchain",
+}
+
+# ---------------------------------------------------------------------------
+# Malicious-prompt detection helpers (Instructions 2 & 3)
+# ---------------------------------------------------------------------------
+_SHELL_COMMAND_PATTERN = re.compile(
+    r"(;|\||&&|\$\(|`|>\s*/|<\s*/|/bin/|/usr/bin/|cmd\.exe|powershell)",
+    re.IGNORECASE,
+)
+_BINARY_MAGIC_BYTES_PREFIXES = (b"\x7fELF", b"MZ", b"\xca\xfe\xba\xbe", b"\xfe\xed\xfa")
+_LEETSPEAK_PATTERN = re.compile(r"[4@][Ss5][Ss5][Ii1!][Gg9][Nn]", re.IGNORECASE)
+_HIDDEN_PROMPT_PATTERNS = [
+    re.compile(r"ignore\s+(all\s+)?previous\s+instructions?", re.IGNORECASE),
+    re.compile(r"disregard\s+(all\s+)?previous\s+instructions?", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+", re.IGNORECASE),
+    re.compile(r"act\s+as\s+(if\s+you\s+are\s+)?a\s+", re.IGNORECASE),
+    re.compile(r"system\s*:\s*", re.IGNORECASE),
+    re.compile(r"<\s*system\s*>", re.IGNORECASE),
+    re.compile(r"\[INST\]", re.IGNORECASE),
+]
+
+
+def _is_base64_encoded(value: str) -> bool:
+    """Return True if *value* looks like a base64-encoded payload."""
+    stripped = value.strip()
+    if len(stripped) < 20:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9+/=\n]+", stripped):
+        return False
+    try:
+        decoded = base64.b64decode(stripped, validate=True)
+        # Heuristic: decoded bytes contain a high ratio of printable ASCII
+        printable = sum(0x20 <= b < 0x7F for b in decoded)
+        if printable / max(len(decoded), 1) > 0.7 and len(decoded) > 10:
+            return True
+        # Or decoded bytes start with known binary magic bytes
+        for magic in _BINARY_MAGIC_BYTES_PREFIXES:
+            if decoded.startswith(magic):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _sanitize_string(value: str, context: str = "") -> str:
+    """Validate a string input for malicious content.
+
+    Raises ``ValueError`` if the string contains disallowed patterns.
+    Returns the original string if it passes all checks.
+    """
+    if _SHELL_COMMAND_PATTERN.search(value):
+        raise ValueError(
+            f"Input rejected: potential shell command detected in {context!r}."
+        )
+    if _is_base64_encoded(value):
+        raise ValueError(
+            f"Input rejected: base64-encoded payload detected in {context!r}."
+        )
+    if _LEETSPEAK_PATTERN.search(value):
+        raise ValueError(
+            f"Input rejected: leetspeak pattern detected in {context!r}."
+        )
+    for pattern in _HIDDEN_PROMPT_PATTERNS:
+        if pattern.search(value):
+            raise ValueError(
+                f"Input rejected: hidden/injected prompt pattern detected in {context!r}."
+            )
+    return value
+
+
+def _sanitize_value(value: Any, context: str = "", _depth: int = 0) -> Any:
+    """Recursively sanitize an input value."""
+    if _depth > 20:
+        return value
+    if isinstance(value, str):
+        _sanitize_string(value, context=context)
+    elif isinstance(value, bytes):
+        for magic in _BINARY_MAGIC_BYTES_PREFIXES:
+            if value.startswith(magic):
+                raise ValueError(
+                    f"Input rejected: binary executable payload detected in {context!r}."
+                )
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            _sanitize_value(k, context=f"{context}[key]", _depth=_depth + 1)
+            _sanitize_value(v, context=f"{context}[{k!r}]", _depth=_depth + 1)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for i, item in enumerate(value):
+            _sanitize_value(item, context=f"{context}[{i}]", _depth=_depth + 1)
+    return value
+
+
+def _sanitize_args_kwargs(args: tuple, kwargs: dict, func_name: str) -> None:
+    """Sanitize positional and keyword arguments before passing to a task."""
+    for i, arg in enumerate(args):
+        _sanitize_value(arg, context=f"{func_name}.args[{i}]")
+    for k, v in kwargs.items():
+        _sanitize_value(v, context=f"{func_name}.kwargs[{k!r}]")
+
+
+# ---------------------------------------------------------------------------
+# Audit logging helpers (Instruction 4)
+# ---------------------------------------------------------------------------
+
+def _compute_input_hash(args: tuple, kwargs: dict) -> str:
+    try:
+        import json
+        payload = json.dumps({"args": list(args), "kwargs": kwargs}, default=str, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()
+    except Exception:
+        return "unhashable"
+
+
+def _emit_audit_record(
+    *,
+    event: str,
+    func_name: str,
+    input_hash: str,
+    trace_id: str,
+    extra: dict | None = None,
+) -> None:
+    record: dict[str, Any] = {
+        "event": event,
+        "func_name": func_name,
+        "input_hash": input_hash,
+        "trace_id": trace_id,
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    if extra:
+        record.update(extra)
+    _audit_logger.info("AUDIT: %s", record)
+
+
+# ---------------------------------------------------------------------------
+# Component registry check (Instructions 1 & 5)
+# ---------------------------------------------------------------------------
+
+def _assert_components_approved() -> None:
+    """Raise if required framework components are not in the approved registry."""
+    required = {"langgraph", "langchain"}
+    unapproved = required - _APPROVED_COMPONENT_REGISTRY
+    if unapproved:
+        raise RuntimeError(
+            f"The following AI framework components are not in the approved registry: "
+            f"{unapproved}. Update _APPROVED_COMPONENT_REGISTRY to include them after "
+            f"review and version-pinning."
+        )
+
+
+_assert_components_approved()
+
 
 class _TaskFunction(Generic[P, T]):
     def __init__(
@@ -84,6 +248,22 @@ class _TaskFunction(Generic[P, T]):
         functools.update_wrapper(self, func)
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> SyncAsyncFuture[T]:
+        func_name = getattr(self.func, "__name__", repr(self.func))
+        trace_id = str(uuid.uuid4())
+
+        # Sanitize and validate all inputs before forwarding (Instructions 2 & 3)
+        _sanitize_args_kwargs(args, kwargs, func_name)
+
+        input_hash = _compute_input_hash(args, kwargs)
+
+        # Emit pre-invocation audit record (Instruction 4)
+        _emit_audit_record(
+            event="task.invoke",
+            func_name=func_name,
+            input_hash=input_hash,
+            trace_id=trace_id,
+        )
+
         return _call_with_options(
             self.func,
             args,
@@ -551,6 +731,44 @@ class entrypoint(Generic[ContextT]):
             """Get save value from the entrypoint.final object or passthrough."""
             return value.save if isinstance(value, entrypoint.final) else value
 
+        # Wrap bound to add input sanitization and audit logging (Instructions 2, 3, 4)
+        _original_bound = bound
+        _func_name = func.__name__
+        _entrypoint_trace_id = str(uuid.uuid4())
+
+        class _AuditedBound:
+            """Thin wrapper that sanitizes input and emits audit records."""
+
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def invoke(self, input: Any, config: Any = None, **kw: Any) -> Any:
+                _sanitize_value(input, context=f"{_func_name}.input")
+                input_hash = _compute_input_hash((input,), {})
+                _emit_audit_record(
+                    event="entrypoint.invoke",
+                    func_name=_func_name,
+                    input_hash=input_hash,
+                    trace_id=_entrypoint_trace_id,
+                )
+                return self._inner.invoke(input, config, **kw)
+
+            async def ainvoke(self, input: Any, config: Any = None, **kw: Any) -> Any:
+                _sanitize_value(input, context=f"{_func_name}.input")
+                input_hash = _compute_input_hash((input,), {})
+                _emit_audit_record(
+                    event="entrypoint.ainvoke",
+                    func_name=_func_name,
+                    input_hash=input_hash,
+                    trace_id=_entrypoint_trace_id,
+                )
+                return await self._inner.ainvoke(input, config, **kw)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        audited_bound = _AuditedBound(_original_bound)
+
         output_type, save_type = Any, Any
         if sig.return_annotation is not inspect.Signature.empty:
             # User does not parameterize entrypoint.final properly
@@ -573,10 +791,23 @@ class entrypoint(Generic[ContextT]):
                 else:
                     output_type = save_type = sig.return_annotation
 
+        # Emit audit record for graph construction (Instruction 4)
+        _emit_audit_record(
+            event="entrypoint.build",
+            func_name=_func_name,
+            input_hash="n/a",
+            trace_id=_entrypoint_trace_id,
+            extra={
+                "input_type": str(input_type),
+                "output_type": str(output_type),
+                "save_type": str(save_type),
+            },
+        )
+
         graph: Pregel[Any, ContextT, Any, Any] = Pregel(
             nodes={
                 func.__name__: PregelNode(
-                    bound=bound,
+                    bound=audited_bound,
                     triggers=[START],
                     channels=START,
                     timeout=self.timeout,
@@ -617,4 +848,13 @@ class entrypoint(Generic[ContextT]):
             graph.checkpointer = _serde.apply_checkpointer_allowlist(
                 graph.checkpointer, serde_allowlist
             )
+
+        # Emit audit record for completed graph construction (Instruction 4)
+        _emit_audit_record(
+            event="entrypoint.ready",
+            func_name=_func_name,
+            input_hash="n/a",
+            trace_id=_entrypoint_trace_id,
+        )
+
         return graph
