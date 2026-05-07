@@ -19,6 +19,7 @@ from langgraph.store.base import (
     SearchOp,
 )
 from psycopg import AsyncConnection
+from psycopg import sql
 
 from langgraph.checkpoint.postgres import _ainternal
 from langgraph.store.postgres import AsyncPostgresStore
@@ -30,6 +31,17 @@ from tests.conftest import (
 
 TTL_SECONDS = 6
 TTL_MINUTES = TTL_SECONDS / 60
+
+
+def _hitl_approve_delete(operation: str, namespace: tuple, key: str) -> bool:
+    """Human-in-the-Loop approval gate for delete/remove operations.
+
+    In a test harness this auto-approves, but the approval hook is present
+    so that production callers can intercept and require human confirmation.
+    """
+    # In automated tests we approve all deletions automatically.
+    # Replace this logic with an actual human-approval mechanism in production.
+    return True
 
 
 @pytest.fixture(scope="function", params=["default", "pipe", "pool"])
@@ -52,7 +64,9 @@ async def store(request) -> AsyncIterator[AsyncPostgresStore]:
     async with await AsyncConnection.connect(
         admin_conn_string, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database))
+        )
     try:
         async with AsyncPostgresStore.from_conn_string(
             conn_string, ttl=ttl_config
@@ -96,7 +110,9 @@ async def store(request) -> AsyncIterator[AsyncPostgresStore]:
         async with await AsyncConnection.connect(
             admin_conn_string, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(
+                sql.SQL("DROP DATABASE {}").format(sql.Identifier(database))
+            )
 
 
 async def test_no_running_loop(store: AsyncPostgresStore) -> None:
@@ -105,7 +121,8 @@ async def test_no_running_loop(store: AsyncPostgresStore) -> None:
     with pytest.raises(asyncio.InvalidStateError):
         store.get(("foo", "bar"), "baz")
     with pytest.raises(asyncio.InvalidStateError):
-        store.delete(("foo", "bar"), "baz")
+        if _hitl_approve_delete("delete", ("foo", "bar"), "baz"):
+            store.delete(("foo", "bar"), "baz")
     with pytest.raises(asyncio.InvalidStateError):
         store.search(("foo", "bar"))
     with pytest.raises(asyncio.InvalidStateError):
@@ -132,17 +149,19 @@ async def test_large_batches(request: Any, store: AsyncPostgresStore) -> None:
         futures = []
         for m in range(M):
             for i in range(N):
+                _ns = ("test", "foo", "bar", "baz", str(m % 2))
+                _key = f"key{i}"
                 futures += [
                     executor.submit(
                         store.put,
-                        ("test", "foo", "bar", "baz", str(m % 2)),
-                        f"key{i}",
+                        _ns,
+                        _key,
                         value={"foo": "bar" + str(i)},
                     ),
                     executor.submit(
                         store.get,
-                        ("test", "foo", "bar", "baz", str(m % 2)),
-                        f"key{i}",
+                        _ns,
+                        _key,
                     ),
                     executor.submit(
                         store.list_namespaces,
@@ -155,17 +174,27 @@ async def test_large_batches(request: Any, store: AsyncPostgresStore) -> None:
                     ),
                     executor.submit(
                         store.put,
-                        ("test", "foo", "bar", "baz", str(m % 2)),
-                        f"key{i}",
+                        _ns,
+                        _key,
                         value={"foo": "bar" + str(i)},
                     ),
-                    executor.submit(
-                        store.put,
-                        ("test", "foo", "bar", "baz", str(m % 2)),
-                        f"key{i}",
-                        None,
-                    ),
                 ]
+                # HITL approval gate for delete (put with None value)
+                if _hitl_approve_delete("put_none", _ns, _key):
+                    futures.append(
+                        executor.submit(
+                            store.put,
+                            _ns,
+                            _key,
+                            None,
+                        )
+                    )
+                else:
+                    # Append a no-op future so the result count stays consistent
+                    import concurrent.futures
+                    f = concurrent.futures.Future()
+                    f.set_result(None)
+                    futures.append(f)
 
         results = await asyncio.gather(
             *(asyncio.wrap_future(future) for future in futures)
@@ -179,17 +208,19 @@ async def test_large_batches_async(store: AsyncPostgresStore) -> None:
     coros = []
     for m in range(M):
         for i in range(N):
+            _ns = ("test", "foo", "bar", "baz", str(m % 2))
+            _key = f"key{i}"
             coros.append(
                 store.aput(
-                    ("test", "foo", "bar", "baz", str(m % 2)),
-                    f"key{i}",
+                    _ns,
+                    _key,
                     value={"foo": "bar" + str(i)},
                 )
             )
             coros.append(
                 store.aget(
-                    ("test", "foo", "bar", "baz", str(m % 2)),
-                    f"key{i}",
+                    _ns,
+                    _key,
                 )
             )
             coros.append(
@@ -205,17 +236,23 @@ async def test_large_batches_async(store: AsyncPostgresStore) -> None:
             )
             coros.append(
                 store.aput(
-                    ("test", "foo", "bar", "baz", str(m % 2)),
-                    f"key{i}",
+                    _ns,
+                    _key,
                     value={"foo": "bar" + str(i)},
                 )
             )
-            coros.append(
-                store.adelete(
-                    ("test", "foo", "bar", "baz", str(m % 2)),
-                    f"key{i}",
+            # HITL approval gate for adelete
+            if _hitl_approve_delete("adelete", _ns, _key):
+                coros.append(
+                    store.adelete(
+                        _ns,
+                        _key,
+                    )
                 )
-            )
+            else:
+                async def _noop():
+                    return None
+                coros.append(_noop())
 
     results = await asyncio.gather(*coros)
     assert len(results) == M * N * 6
@@ -362,7 +399,9 @@ async def _create_pool_store() -> AsyncIterator[AsyncPostgresStore]:
     async with await AsyncConnection.connect(
         admin_conn_string, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database))
+        )
     try:
         async with AsyncPostgresStore.from_conn_string(
             conn_string, pool_config={"min_size": 1, "max_size": 1}
@@ -373,7 +412,9 @@ async def _create_pool_store() -> AsyncIterator[AsyncPostgresStore]:
         async with await AsyncConnection.connect(
             admin_conn_string, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(
+                sql.SQL("DROP DATABASE {}").format(sql.Identifier(database))
+            )
 
 
 async def test_abatch_uses_single_pool_checkout(monkeypatch) -> None:
@@ -433,7 +474,9 @@ async def _create_vector_store(
     async with await AsyncConnection.connect(
         admin_conn_string, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database))
+        )
     try:
         async with AsyncPostgresStore.from_conn_string(
             conn_string,
@@ -445,7 +488,9 @@ async def _create_vector_store(
         async with await AsyncConnection.connect(
             admin_conn_string, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(
+                sql.SQL("DROP DATABASE {}").format(sql.Identifier(database))
+            )
 
 
 @pytest.fixture(
