@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import logging
+import re
+import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from datetime import timedelta
 from functools import cached_property
@@ -20,6 +26,114 @@ from langgraph.types import CachePolicy, RetryPolicy, TimeoutPolicy
 
 READ_TYPE = Callable[[str | Sequence[str], bool], Any | dict[str, Any]]
 INPUT_CACHE_KEY_TYPE = tuple[Callable[..., Any], tuple[str, ...]]
+
+_audit_logger = logging.getLogger("langgraph.audit")
+
+_APPROVED_FRAMEWORKS: frozenset[str] = frozenset()
+
+_MALICIOUS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?i)(ignore\s+(previous|prior|above)\s+instructions?)"),
+    re.compile(r"(?i)(system\s*prompt|you\s+are\s+now|act\s+as\s+if)"),
+    re.compile(r"(?i)(exec\s*\(|eval\s*\(|subprocess|os\.system|shell\s*=\s*True)"),
+    re.compile(r"(?i)(\bsudo\b|\brm\s+-rf\b|\bchmod\b|\bchown\b)"),
+    re.compile(r"(?i)(base64\.b64decode|__import__|importlib\.import_module)"),
+    re.compile(r"(?i)(drop\s+table|delete\s+from|insert\s+into|union\s+select)"),
+]
+
+_BASE64_PATTERN = re.compile(
+    r"(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
+)
+
+_LEET_MAP: dict[str, str] = {
+    "0": "o",
+    "1": "i",
+    "3": "e",
+    "4": "a",
+    "5": "s",
+    "7": "t",
+    "@": "a",
+    "$": "s",
+    "!": "i",
+}
+
+
+def _decode_leet(text: str) -> str:
+    return "".join(_LEET_MAP.get(c, c) for c in text)
+
+
+def _check_base64_payload(text: str) -> bool:
+    for match in _BASE64_PATTERN.finditer(text):
+        try:
+            decoded = base64.b64decode(match.group()).decode("utf-8", errors="ignore")
+            for pattern in _MALICIOUS_PATTERNS:
+                if pattern.search(decoded):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _sanitize_and_validate_input(input: Any) -> Any:
+    if input is None:
+        return input
+    text_to_check: str | None = None
+    if isinstance(input, str):
+        text_to_check = input
+    elif isinstance(input, dict):
+        text_to_check = str(input)
+    elif isinstance(input, (list, tuple)):
+        text_to_check = str(input)
+    if text_to_check is not None:
+        for pattern in _MALICIOUS_PATTERNS:
+            if pattern.search(text_to_check):
+                raise ValueError(
+                    f"Input rejected by security policy: potentially malicious content detected."
+                )
+        leet_decoded = _decode_leet(text_to_check)
+        for pattern in _MALICIOUS_PATTERNS:
+            if pattern.search(leet_decoded):
+                raise ValueError(
+                    f"Input rejected by security policy: potentially malicious content detected (leet variant)."
+                )
+        if _check_base64_payload(text_to_check):
+            raise ValueError(
+                f"Input rejected by security policy: potentially malicious base64-encoded content detected."
+            )
+    return input
+
+
+def _compute_input_hash(input: Any) -> str:
+    try:
+        return hashlib.sha256(str(input).encode("utf-8", errors="replace")).hexdigest()
+    except Exception:
+        return "unhashable"
+
+
+def _emit_audit_record(
+    *,
+    operation: str,
+    input_hash: str,
+    node_bound: Any,
+    config: RunnableConfig | None,
+    trace_id: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    bound_name = getattr(node_bound, "name", None) or type(node_bound).__name__
+    run_id = None
+    if config:
+        run_id = str(config.get("run_id", "")) or None
+    record: dict[str, Any] = {
+        "audit_event": "pregel_node_invocation",
+        "operation": operation,
+        "timestamp": time.time(),
+        "trace_id": trace_id,
+        "run_id": run_id,
+        "node_bound": bound_name,
+        "input_hash": input_hash,
+    }
+    if extra:
+        record.update(extra)
+    _audit_logger.info("AUDIT: %s", record)
 
 
 class ChannelRead(RunnableCallable):
@@ -61,14 +175,38 @@ class ChannelRead(RunnableCallable):
         return super().get_name(suffix, name=name)
 
     def _read(self, _: Any, config: RunnableConfig) -> Any:
-        return self.do_read(
+        result = self.do_read(
             config, select=self.channel, fresh=self.fresh, mapper=self.mapper
         )
+        _audit_logger.info(
+            "AUDIT: %s",
+            {
+                "audit_event": "channel_read",
+                "operation": "_read",
+                "timestamp": time.time(),
+                "channel": self.channel,
+                "fresh": self.fresh,
+                "result_hash": _compute_input_hash(result),
+            },
+        )
+        return result
 
     async def _aread(self, _: Any, config: RunnableConfig) -> Any:
-        return self.do_read(
+        result = self.do_read(
             config, select=self.channel, fresh=self.fresh, mapper=self.mapper
         )
+        _audit_logger.info(
+            "AUDIT: %s",
+            {
+                "audit_event": "channel_read",
+                "operation": "_aread",
+                "timestamp": time.time(),
+                "channel": self.channel,
+                "fresh": self.fresh,
+                "result_hash": _compute_input_hash(result),
+            },
+        )
+        return result
 
     @staticmethod
     def do_read(
@@ -86,9 +224,21 @@ class ChannelRead(RunnableCallable):
                 "Make sure to call in the context of a Pregel process"
             )
         if mapper:
-            return mapper(read(select, fresh))
+            result = mapper(read(select, fresh))
         else:
-            return read(select, fresh)
+            result = read(select, fresh)
+        _audit_logger.info(
+            "AUDIT: %s",
+            {
+                "audit_event": "channel_read",
+                "operation": "do_read",
+                "timestamp": time.time(),
+                "select": select,
+                "fresh": fresh,
+                "result_hash": _compute_input_hash(result),
+            },
+        )
+        return result
 
 
 DEFAULT_BOUND = RunnableCallable(lambda input: input)
@@ -250,12 +400,33 @@ class PregelNode:
         config: RunnableConfig | None = None,
         **kwargs: Any | None,
     ) -> Any:
+        _sanitize_and_validate_input(input)
+        trace_id = str(uuid.uuid4())
+        input_hash = _compute_input_hash(input)
+        _emit_audit_record(
+            operation="invoke",
+            input_hash=input_hash,
+            node_bound=self.bound,
+            config=config,
+            trace_id=trace_id,
+        )
         self_config: RunnableConfig = {"metadata": self.metadata, "tags": self.tags}
-        return self.bound.invoke(
+        result = self.bound.invoke(
             input,
             merge_configs(self_config, config),
             **kwargs,
         )
+        _audit_logger.info(
+            "AUDIT: %s",
+            {
+                "audit_event": "pregel_node_invocation_result",
+                "operation": "invoke",
+                "timestamp": time.time(),
+                "trace_id": trace_id,
+                "output_hash": _compute_input_hash(result),
+            },
+        )
+        return result
 
     async def ainvoke(
         self,
@@ -263,12 +434,33 @@ class PregelNode:
         config: RunnableConfig | None = None,
         **kwargs: Any | None,
     ) -> Any:
+        _sanitize_and_validate_input(input)
+        trace_id = str(uuid.uuid4())
+        input_hash = _compute_input_hash(input)
+        _emit_audit_record(
+            operation="ainvoke",
+            input_hash=input_hash,
+            node_bound=self.bound,
+            config=config,
+            trace_id=trace_id,
+        )
         self_config: RunnableConfig = {"metadata": self.metadata, "tags": self.tags}
-        return await self.bound.ainvoke(
+        result = await self.bound.ainvoke(
             input,
             merge_configs(self_config, config),
             **kwargs,
         )
+        _audit_logger.info(
+            "AUDIT: %s",
+            {
+                "audit_event": "pregel_node_invocation_result",
+                "operation": "ainvoke",
+                "timestamp": time.time(),
+                "trace_id": trace_id,
+                "output_hash": _compute_input_hash(result),
+            },
+        )
+        return result
 
     def stream(
         self,
@@ -276,12 +468,36 @@ class PregelNode:
         config: RunnableConfig | None = None,
         **kwargs: Any | None,
     ) -> Iterator[Any]:
+        _sanitize_and_validate_input(input)
+        trace_id = str(uuid.uuid4())
+        input_hash = _compute_input_hash(input)
+        _emit_audit_record(
+            operation="stream",
+            input_hash=input_hash,
+            node_bound=self.bound,
+            config=config,
+            trace_id=trace_id,
+        )
         self_config: RunnableConfig = {"metadata": self.metadata, "tags": self.tags}
-        yield from self.bound.stream(
+        chunk_index = 0
+        for item in self.bound.stream(
             input,
             merge_configs(self_config, config),
             **kwargs,
-        )
+        ):
+            _audit_logger.info(
+                "AUDIT: %s",
+                {
+                    "audit_event": "pregel_node_stream_chunk",
+                    "operation": "stream",
+                    "timestamp": time.time(),
+                    "trace_id": trace_id,
+                    "chunk_index": chunk_index,
+                    "chunk_hash": _compute_input_hash(item),
+                },
+            )
+            chunk_index += 1
+            yield item
 
     async def astream(
         self,
@@ -289,10 +505,33 @@ class PregelNode:
         config: RunnableConfig | None = None,
         **kwargs: Any | None,
     ) -> AsyncIterator[Any]:
+        _sanitize_and_validate_input(input)
+        trace_id = str(uuid.uuid4())
+        input_hash = _compute_input_hash(input)
+        _emit_audit_record(
+            operation="astream",
+            input_hash=input_hash,
+            node_bound=self.bound,
+            config=config,
+            trace_id=trace_id,
+        )
         self_config: RunnableConfig = {"metadata": self.metadata, "tags": self.tags}
+        chunk_index = 0
         async for item in self.bound.astream(
             input,
             merge_configs(self_config, config),
             **kwargs,
         ):
+            _audit_logger.info(
+                "AUDIT: %s",
+                {
+                    "audit_event": "pregel_node_stream_chunk",
+                    "operation": "astream",
+                    "timestamp": time.time(),
+                    "trace_id": trace_id,
+                    "chunk_index": chunk_index,
+                    "chunk_hash": _compute_input_hash(item),
+                },
+            )
+            chunk_index += 1
             yield item
