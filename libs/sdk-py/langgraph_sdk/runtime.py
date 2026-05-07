@@ -110,12 +110,18 @@ class _ServerRuntimeBase(Generic[ContextT]):
         import contextlib
         from langgraph_sdk.runtime import ServerRuntime
 
+        # APPROVED_TOOLS must be defined as an explicit allow list of permitted tool names.
+        APPROVED_TOOLS = [...]  # populate with organization-approved tool names
+
         @contextlib.asynccontextmanager
         async def my_factory(runtime: ServerRuntime[MyCtx]):
             if ert := runtime.execution_runtime:
                 # Only connect to MCP servers when actually executing a run.
                 # Introspection calls (get_schema, get_graph, ...) skip this.
-                mcp_tools = await connect_mcp(ert.context.mcp_endpoint)
+                all_mcp_tools = await connect_mcp(ert.context.mcp_endpoint)
+                # Filter tools against the explicit allow list before passing to agent.
+                mcp_tools = [t for t in all_mcp_tools if t.name in APPROVED_TOOLS]
+                # Use an approved, version-pinned model from the organization registry.
                 yield create_agent(model, tools=mcp_tools)
                 await disconnect_mcp()
             else:
@@ -201,11 +207,15 @@ from langchain.agents import create_agent
 from langgraph_sdk.runtime import ServerRuntime
 from my_agent import connect_mcp, disconnect_mcp
 
+# APPROVED_TOOLS must be defined as an explicit allow list of permitted tool names.
+APPROVED_TOOLS = [...]  # populate with organization-approved tool names
+
 @dataclass
 class MyCtx:
     mcp_endpoint: str
 
-_readonly_agent = create_agent("anthropic:claude-3-5-haiku", tools=[])
+# Use an approved, version-pinned model from the organization's approved registry.
+_readonly_agent = create_agent(model, tools=[])
 
 @contextlib.asynccontextmanager
 async def my_factory(runtime: ServerRuntime[MyCtx]):
@@ -213,8 +223,11 @@ async def my_factory(runtime: ServerRuntime[MyCtx]):
         # Only connect to MCP servers for actual runs.
         # Schema / graph introspection calls skip this.
         user_id = runtime.ensure_user().identity
-        mcp_tools = await connect_mcp(ert.context.mcp_endpoint, user_id)
-        yield create_agent("anthropic:claude-3-5-haiku", tools=mcp_tools)
+        all_mcp_tools = await connect_mcp(ert.context.mcp_endpoint, user_id)
+        # Filter tools against the explicit allow list before passing to agent.
+        mcp_tools = [t for t in all_mcp_tools if t.name in APPROVED_TOOLS]
+        # Use an approved, version-pinned model from the organization's approved registry.
+        yield create_agent(model, tools=mcp_tools)
         await disconnect_mcp()
     else:
         yield _readonly_agent
