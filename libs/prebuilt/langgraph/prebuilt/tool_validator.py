@@ -65,7 +65,7 @@ class ValidationNode(RunnableCallable):
         from typing import Literal, Annotated
         from typing_extensions import TypedDict
 
-        from langchain_anthropic import ChatAnthropic
+        from langchain_openai import ChatOpenAI
         from pydantic import BaseModel, field_validator
 
         from langgraph.graph import END, START, StateGraph
@@ -82,7 +82,7 @@ class ValidationNode(RunnableCallable):
                 return v
 
         builder = StateGraph(Annotated[list, add_messages])
-        llm = ChatAnthropic(model="claude-3-5-haiku-latest").bind_tools([SelectNumber])
+        llm = ChatOpenAI(model="gpt-4o").bind_tools([SelectNumber])
         builder.add_node("model", llm)
         builder.add_node("validation", ValidationNode([SelectNumber]))
         builder.add_edge(START, "model")
