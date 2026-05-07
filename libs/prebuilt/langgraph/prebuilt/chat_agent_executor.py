@@ -1,4 +1,5 @@
 import inspect
+import logging
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from typing import (
@@ -45,6 +46,8 @@ from pydantic import BaseModel
 from typing_extensions import NotRequired, TypedDict, deprecated
 
 from langgraph.prebuilt.tool_node import ToolCallWithContext, ToolNode
+
+logger = logging.getLogger(__name__)
 
 StructuredResponse = dict | BaseModel
 StructuredResponseSchema = dict | type[BaseModel]
@@ -671,12 +674,16 @@ def create_react_agent(
 
         model_input = _get_model_input_state(state)
 
+        logger.debug("Invoking LLM with input messages: %s", _get_state_value(model_input, "messages"))
+
         if is_dynamic_model:
             # Resolve dynamic model at runtime and apply prompt
             dynamic_model = _resolve_model(state, runtime)
             response = cast(AIMessage, dynamic_model.invoke(model_input, config))  # type: ignore[arg-type]
         else:
             response = cast(AIMessage, static_model.invoke(model_input, config))  # type: ignore[union-attr]
+
+        logger.debug("LLM response: %s", response)
 
         # add agent name to the AIMessage
         response.name = name
@@ -698,6 +705,8 @@ def create_react_agent(
     ) -> StateSchema:
         model_input = _get_model_input_state(state)
 
+        logger.debug("Invoking LLM with input messages: %s", _get_state_value(model_input, "messages"))
+
         if is_dynamic_model:
             # Resolve dynamic model at runtime and apply prompt
             # (supports both sync and async)
@@ -705,6 +714,8 @@ def create_react_agent(
             response = cast(AIMessage, await dynamic_model.ainvoke(model_input, config))  # type: ignore[arg-type]
         else:
             response = cast(AIMessage, await static_model.ainvoke(model_input, config))  # type: ignore[union-attr]
+
+        logger.debug("LLM response: %s", response)
 
         # add agent name to the AIMessage
         response.name = name
@@ -757,6 +768,8 @@ def create_react_agent(
             system_prompt, structured_response_schema = response_format
             messages = [SystemMessage(content=system_prompt)] + list(messages)
 
+        logger.debug("Invoking LLM for structured response with messages: %s", messages)
+
         resolved_model = _resolve_model(state, runtime)
         model_with_structured_output = _get_model(
             resolved_model
@@ -764,6 +777,9 @@ def create_react_agent(
             cast(StructuredResponseSchema, structured_response_schema)
         )
         response = model_with_structured_output.invoke(messages, config)
+
+        logger.debug("LLM structured response: %s", response)
+
         return {"structured_response": response}
 
     async def agenerate_structured_response(
@@ -775,6 +791,8 @@ def create_react_agent(
             system_prompt, structured_response_schema = response_format
             messages = [SystemMessage(content=system_prompt)] + list(messages)
 
+        logger.debug("Invoking LLM for structured response with messages: %s", messages)
+
         resolved_model = await _aresolve_model(state, runtime)
         model_with_structured_output = _get_model(
             resolved_model
@@ -782,6 +800,9 @@ def create_react_agent(
             cast(StructuredResponseSchema, structured_response_schema)
         )
         response = await model_with_structured_output.ainvoke(messages, config)
+
+        logger.debug("LLM structured response: %s", response)
+
         return {"structured_response": response}
 
     if not tool_calling_enabled:
