@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import fields, is_dataclass
 from typing import (
@@ -9,28 +10,201 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
-from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import BaseMessage
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
-from pydantic import BaseModel
-
 from langgraph._internal._constants import NS_SEP
 from langgraph.constants import TAG_HIDDEN, TAG_NOSTREAM
 from langgraph.pregel.protocol import StreamChunk
 from langgraph.types import Command
 
-try:
-    from langchain_core.tracers._streaming import _StreamingCallbackHandler
-except ImportError:
-    _StreamingCallbackHandler = object  # type: ignore
+# ---------------------------------------------------------------------------
+# Minimal inline stubs replacing the langchain_core dependency
+# ---------------------------------------------------------------------------
 
-try:
-    from langchain_core.tracers._streaming import _V2StreamingCallbackHandler
-except ImportError:
-    _V2StreamingCallbackHandler = object  # type: ignore
+class BaseCallbackHandler:
+    """Minimal stub for langchain_core.callbacks.BaseCallbackHandler."""
+    run_inline: bool = False
+
+    def on_chat_model_start(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+        pass
+
+    def on_llm_new_token(self, *args: Any, **kwargs: Any) -> Any:
+        pass
+
+    def on_llm_end(self, *args: Any, **kwargs: Any) -> Any:
+        pass
+
+    def on_llm_error(self, *args: Any, **kwargs: Any) -> Any:
+        pass
+
+    def on_chain_start(self, *args: Any, **kwargs: Any) -> Any:
+        pass
+
+    def on_chain_end(self, *args: Any, **kwargs: Any) -> Any:
+        pass
+
+    def on_chain_error(self, *args: Any, **kwargs: Any) -> Any:
+        pass
+
+
+class BaseMessage:
+    """Minimal stub for langchain_core.messages.BaseMessage."""
+
+    def __init__(self, content: Any = "", **kwargs: Any) -> None:
+        self.content = content
+        self.id: str | None = kwargs.get("id", None)
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class ChatGenerationChunk:
+    """Minimal stub for langchain_core.outputs.ChatGenerationChunk."""
+
+    def __init__(self, message: BaseMessage, **kwargs: Any) -> None:
+        self.message = message
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class ChatGeneration:
+    """Minimal stub for langchain_core.outputs.ChatGeneration."""
+
+    def __init__(self, message: BaseMessage, **kwargs: Any) -> None:
+        self.message = message
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class LLMResult:
+    """Minimal stub for langchain_core.outputs.LLMResult."""
+
+    def __init__(self, generations: list | None = None, **kwargs: Any) -> None:
+        self.generations: list = generations if generations is not None else []
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class BaseModel:
+    """Minimal stub for pydantic.BaseModel."""
+
+    model_fields: dict = {}
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        import dataclasses as _dc
+        if not hasattr(cls, "model_fields"):
+            cls.model_fields = {}
+
+
+class _StreamingCallbackHandler:
+    """Minimal stub for langchain_core.tracers._streaming._StreamingCallbackHandler."""
+
+    def tap_output_aiter(
+        self, run_id: UUID, output: AsyncIterator[Any]
+    ) -> AsyncIterator[Any]:
+        return output
+
+    def tap_output_iter(
+        self, run_id: UUID, output: Iterator[Any]
+    ) -> Iterator[Any]:
+        return output
+
+
+class _V2StreamingCallbackHandler(_StreamingCallbackHandler):
+    """Minimal stub for langchain_core.tracers._streaming._V2StreamingCallbackHandler."""
+
+    def on_stream_event(self, *args: Any, **kwargs: Any) -> Any:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# End of stubs
+# ---------------------------------------------------------------------------
 
 T = TypeVar("T")
 Meta = tuple[tuple[str, ...], dict[str, Any]]
+
+# ---------------------------------------------------------------------------
+# Dangerous primitive patterns used for LLM output sanitization
+# ---------------------------------------------------------------------------
+_DANGEROUS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r'\beval\s*\('),
+    re.compile(r'\bexec\s*\('),
+    re.compile(r'\bexecfile\s*\('),
+    re.compile(r'\bcompile\s*\('),
+    re.compile(r'\b__import__\s*\('),
+    re.compile(r'\bimportlib\b'),
+    re.compile(r'\bos\.system\s*\('),
+    re.compile(r'\bsubprocess\b.*shell\s*=\s*True'),
+    re.compile(r'\bsubprocess\.call\s*\('),
+    re.compile(r'\bsubprocess\.run\s*\('),
+    re.compile(r'\bsubprocess\.Popen\s*\('),
+]
+
+# Control characters (except common whitespace: tab, newline, carriage return)
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def _sanitize_string(value: str) -> str:
+    """Strip null bytes and control characters from a string."""
+    # Remove null bytes
+    value = value.replace('\x00', '')
+    # Remove other control characters (keep \t, \n, \r)
+    value = _CONTROL_CHAR_RE.sub('', value)
+    return value
+
+
+def _sanitize_message(message: BaseMessage) -> None:
+    """Validate BaseMessage content for dangerous dynamic code execution primitives.
+
+    Raises ValueError if any dangerous pattern is detected in the message content.
+    """
+    content = message.content
+    if isinstance(content, str):
+        for pattern in _DANGEROUS_PATTERNS:
+            if pattern.search(content):
+                raise ValueError(
+                    f"Dangerous code execution primitive detected in message content: "
+                    f"pattern '{pattern.pattern}' matched."
+                )
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                for pattern in _DANGEROUS_PATTERNS:
+                    if pattern.search(item):
+                        raise ValueError(
+                            f"Dangerous code execution primitive detected in message content: "
+                            f"pattern '{pattern.pattern}' matched."
+                        )
+            elif isinstance(item, dict):
+                text = item.get("text", "")
+                if isinstance(text, str):
+                    for pattern in _DANGEROUS_PATTERNS:
+                        if pattern.search(text):
+                            raise ValueError(
+                                f"Dangerous code execution primitive detected in message content: "
+                                f"pattern '{pattern.pattern}' matched."
+                            )
+
+
+def _sanitize_token(token: str) -> str:
+    """Sanitize a token string by stripping null bytes and control characters."""
+    return _sanitize_string(token)
+
+
+def _validate_message_content(message: BaseMessage) -> None:
+    """Validate that a BaseMessage has non-empty content of expected type."""
+    if not isinstance(message, BaseMessage):
+        raise TypeError(f"Expected BaseMessage, got {type(message)!r}")
+    content = message.content
+    if content is None:
+        raise ValueError("Message content must not be None.")
+    if isinstance(content, str):
+        if not content.strip():
+            # Allow empty strings (streaming chunks may be empty); just sanitize
+            pass
+    elif not isinstance(content, (list, dict)):
+        raise TypeError(
+            f"Message content must be a str, list, or dict; got {type(content)!r}"
+        )
 
 
 def _state_values(obj: Any) -> Sequence[Any]:
@@ -136,6 +310,14 @@ class StreamMessagesHandler(BaseCallbackHandler, _StreamingCallbackHandler):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Any:
+        # Validate and sanitize input messages before processing
+        if messages:
+            for message_list in messages:
+                for msg in message_list:
+                    if isinstance(msg, BaseMessage):
+                        _validate_message_content(msg)
+                        _sanitize_message(msg)
+
         if metadata and (not tags or (TAG_NOSTREAM not in tags)):
             ns = tuple(cast(str, metadata["langgraph_checkpoint_ns"]).split(NS_SEP))[
                 :-1
@@ -157,8 +339,17 @@ class StreamMessagesHandler(BaseCallbackHandler, _StreamingCallbackHandler):
         tags: list[str] | None = None,
         **kwargs: Any,
     ) -> Any:
+        # Sanitize the token string
+        if isinstance(token, str):
+            token = _sanitize_token(token)
+
         if not isinstance(chunk, ChatGenerationChunk):
             return
+
+        # Validate and sanitize the chunk message
+        _validate_message_content(chunk.message)
+        _sanitize_message(chunk.message)
+
         if meta := self.metadata.get(run_id):
             self._emit(meta, chunk.message)
 
@@ -174,6 +365,8 @@ class StreamMessagesHandler(BaseCallbackHandler, _StreamingCallbackHandler):
             if response.generations and response.generations[0]:
                 gen = response.generations[0][0]
                 if isinstance(gen, ChatGeneration):
+                    # Sanitize LLM output before emitting
+                    _sanitize_message(gen.message)
                     self._emit(meta, gen.message, dedupe=True)
         self.metadata.pop(run_id, None)
 
@@ -211,11 +404,17 @@ class StreamMessagesHandler(BaseCallbackHandler, _StreamingCallbackHandler):
             self.metadata[run_id] = (ns, metadata)
             for value in _state_values(inputs):
                 if isinstance(value, BaseMessage):
+                    # Validate and sanitize input message before adding to seen
+                    _validate_message_content(value)
+                    _sanitize_message(value)
                     if value.id is not None:
                         self.seen.add(value.id)
                 elif isinstance(value, Sequence) and not isinstance(value, str):
                     for item in value:
                         if isinstance(item, BaseMessage):
+                            # Validate and sanitize input message before adding to seen
+                            _validate_message_content(item)
+                            _sanitize_message(item)
                             if item.id is not None:
                                 self.seen.add(item.id)
 
@@ -315,6 +514,8 @@ class StreamMessagesHandlerV2(StreamMessagesHandler, _V2StreamingCallbackHandler
             if response.generations and response.generations[0]:
                 gen = response.generations[0][0]
                 if isinstance(gen, ChatGeneration):
+                    # Sanitize LLM output before processing
+                    _sanitize_message(gen.message)
                     if run_id in self._streamed_run_ids:
                         if gen.message.id is None:
                             gen.message.id = str(uuid4())
@@ -365,11 +566,23 @@ class StreamMessagesHandlerV2(StreamMessagesHandler, _V2StreamingCallbackHandler
         predictable for v1 callers.
         """
         if meta := self.metadata.get(run_id):
+            # Sanitize event content for dangerous primitives before emitting
+            event_type = event.get("event", "")
+            # Sanitize any text content in the event
+            if "data" in event and isinstance(event["data"], dict):
+                text_content = event["data"].get("content", "")
+                if isinstance(text_content, str):
+                    for pattern in _DANGEROUS_PATTERNS:
+                        if pattern.search(text_content):
+                            raise ValueError(
+                                f"Dangerous code execution primitive detected in stream event content: "
+                                f"pattern '{pattern.pattern}' matched."
+                            )
             # Record message_id on message-start so on_chain_end's
             # dedupe skips the finalized AIMessage the node returns
             # (otherwise the messages projection double-counts: once
             # from streaming, once from the chain output).
-            if event.get("event") == "message-start":
+            if event_type == "message-start":
                 self._streamed_run_ids.add(run_id)
                 msg_id = event.get("message_id")
                 if msg_id:

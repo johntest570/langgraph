@@ -1,4 +1,10 @@
+import hashlib
+import hmac
+import logging
 import operator
+import os
+import time
+import uuid
 from collections.abc import Sequence
 from functools import partial
 from random import choice
@@ -8,6 +14,75 @@ from pydantic import BaseModel, Field, field_validator
 
 from langgraph.constants import END, START
 from langgraph.graph.state import StateGraph
+
+# Audit logger for decision logging and forensic readiness
+audit_logger = logging.getLogger("audit.ai_decisions")
+audit_logger.setLevel(logging.INFO)
+if not audit_logger.handlers:
+    _audit_handler = logging.StreamHandler()
+    _audit_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    audit_logger.addHandler(_audit_handler)
+
+_SESSION_TOKEN_SECRET = os.environ.get("SESSION_TOKEN_SECRET", os.urandom(32).hex())
+_SESSION_TOKEN_TTL = int(os.environ.get("SESSION_TOKEN_TTL", "3600"))
+
+
+def _generate_session_token(subject: str = "bench") -> str:
+    """Generate a cryptographically random, HMAC-signed, expiry-bound session token."""
+    random_id = uuid.uuid4().hex
+    issued_at = int(time.time())
+    expires_at = issued_at + _SESSION_TOKEN_TTL
+    payload = f"{random_id}:{subject}:{issued_at}:{expires_at}"
+    signature = hmac.new(
+        _SESSION_TOKEN_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}:{signature}"
+
+
+def _verify_session_token(token: str) -> str:
+    """Verify HMAC signature and expiry of a session token. Returns the random_id portion."""
+    try:
+        parts = token.rsplit(":", 1)
+        if len(parts) != 2:
+            raise ValueError("Malformed session token")
+        payload, signature = parts
+        expected_sig = hmac.new(
+            _SESSION_TOKEN_SECRET.encode(),
+            payload.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected_sig):
+            raise ValueError("Session token signature verification failed")
+        payload_parts = payload.split(":")
+        if len(payload_parts) != 4:
+            raise ValueError("Malformed session token payload")
+        random_id, subject, issued_at_str, expires_at_str = payload_parts
+        expires_at = int(expires_at_str)
+        if time.time() > expires_at:
+            raise ValueError("Session token has expired")
+        return random_id
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"Invalid session token: {exc}") from exc
+
+
+def _audit_log(trace_id: str, node_name: str, input_state, output: dict) -> None:
+    """Emit a structured audit record for an AI-driven node execution."""
+    input_repr = repr(input_state)
+    input_hash = hashlib.sha256(input_repr.encode()).hexdigest()
+    output_repr = repr(output)
+    output_hash = hashlib.sha256(output_repr.encode()).hexdigest()
+    audit_logger.info(
+        "AUDIT trace_id=%s node=%s timestamp=%s input_hash=%s output_hash=%s",
+        trace_id,
+        node_name,
+        time.time(),
+        input_hash,
+        output_hash,
+    )
 
 
 def pydantic_state(n: int) -> StateGraph:
@@ -232,12 +307,15 @@ def pydantic_state(n: int) -> StateGraph:
         "issue",
     }
 
+    # Shared trace identifier linking all node executions for end-to-end reconstruction
+    _trace_id = uuid.uuid4().hex
+
     def read_write(read: str, write: Sequence[str], input: State) -> dict:
         val = getattr(input, read)
         val = {val: val} if isinstance(val, str) else val
         val_single = val[-1] if isinstance(val, list) else val
         val_list = val if isinstance(val, list) else [val]
-        return {
+        output = {
             k: val_list
             if k in list_fields
             else val_single
@@ -245,6 +323,9 @@ def pydantic_state(n: int) -> StateGraph:
             else "".join(choice("abcdefghijklmnopqrstuvwxyz") for _ in range(n))
             for k in write
         }
+        node_name = f"read_write({read}->{list(write)})"
+        _audit_log(_trace_id, node_name, input, output)
+        return output
 
     builder = StateGraph(State)
     builder.add_edge(START, "one")
@@ -317,7 +398,12 @@ if __name__ == "__main__":
             }
         ]
     }
-    config = {"configurable": {"thread_id": "1"}, "recursion_limit": 20000000000}
+
+    # Generate a cryptographically random, HMAC-signed, expiry-bound session token
+    _session_token = _generate_session_token(subject="bench")
+    _verified_thread_id = _verify_session_token(_session_token)
+
+    config = {"configurable": {"thread_id": _verified_thread_id}, "recursion_limit": 20000000000}
 
     async def run():
         async for c in graph.astream(input, config=config):

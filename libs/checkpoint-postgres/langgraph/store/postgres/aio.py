@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from types import TracebackType
@@ -37,6 +40,83 @@ from langgraph.store.postgres.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Approved model registry: only models listed here are permitted for embedding workloads.
+_APPROVED_EMBEDDING_MODELS: set[str] = {
+    "openai:text-embedding-3-small",
+    "openai:text-embedding-3-large",
+    "openai:text-embedding-ada-002",
+}
+
+
+def _validate_embedding_model(index_config: PostgresIndexConfig) -> None:
+    """Validate that the embedding model specified in index_config is in the approved registry."""
+    embed = index_config.get("embed") if isinstance(index_config, dict) else getattr(index_config, "embed", None)
+    model_id: str | None = None
+    if isinstance(embed, str):
+        model_id = embed
+    elif embed is not None and hasattr(embed, "model"):
+        model_id = getattr(embed, "model", None)
+    elif embed is not None and hasattr(embed, "model_name"):
+        model_id = getattr(embed, "model_name", None)
+
+    if model_id is not None and model_id not in _APPROVED_EMBEDDING_MODELS:
+        raise ValueError(
+            f"Embedding model '{model_id}' is not in the approved model registry. "
+            f"Approved models: {sorted(_APPROVED_EMBEDDING_MODELS)}"
+        )
+    if model_id is None and embed is not None:
+        # embed is a callable or object without a detectable model id; log a warning
+        logger.warning(
+            "audit",
+            extra={
+                "event": "embedding_model_unverified",
+                "message": "Cannot verify embedding model identity against approved registry; "
+                           "ensure only approved models are used.",
+            },
+        )
+
+
+def _make_trace_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _hash_ops(ops: Iterable[Op]) -> str:
+    ops_list = list(ops)
+    try:
+        serialized = orjson.dumps([repr(op) for op in ops_list])
+    except Exception:
+        serialized = repr(ops_list).encode()
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _log_audit_event(
+    event: str,
+    trace_id: str,
+    *,
+    op_types: list[str] | None = None,
+    num_ops: int | None = None,
+    input_hash: str | None = None,
+    model_id: str | None = None,
+    timestamp: float | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    record: dict[str, Any] = {
+        "event": event,
+        "trace_id": trace_id,
+        "timestamp": timestamp or time.time(),
+    }
+    if op_types is not None:
+        record["op_types"] = op_types
+    if num_ops is not None:
+        record["num_ops"] = num_ops
+    if input_hash is not None:
+        record["input_hash"] = input_hash
+    if model_id is not None:
+        record["model_id"] = model_id
+    if extra:
+        record.update(extra)
+    logger.info("audit", extra=record)
 
 
 class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Conn]):
@@ -152,7 +232,15 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
         self.supports_pipeline = Capabilities().has_pipeline()
         self.index_config = index
         if self.index_config:
+            _validate_embedding_model(self.index_config)
             self.embeddings, self.index_config = _ensure_index_config(self.index_config)
+            _model_id = getattr(self.embeddings, "model", None) or getattr(self.embeddings, "model_name", None)
+            _log_audit_event(
+                "embedding_model_initialized",
+                _make_trace_id(),
+                model_id=str(_model_id) if _model_id else None,
+                extra={"store_class": self.__class__.__name__},
+            )
         else:
             self.embeddings = None
 
@@ -161,14 +249,49 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
         self._ttl_stop_event = asyncio.Event()
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
-        grouped_ops, num_ops = _group_ops(ops)
+        ops_list = list(ops)
+        trace_id = _make_trace_id()
+        input_hash = _hash_ops(ops_list)
+        op_types = list({type(op).__name__ for op in ops_list})
+        timestamp = time.time()
+
+        _log_audit_event(
+            "abatch_start",
+            trace_id,
+            op_types=op_types,
+            num_ops=len(ops_list),
+            input_hash=input_hash,
+            timestamp=timestamp,
+        )
+
+        grouped_ops, num_ops = _group_ops(ops_list)
         results: list[Result] = [None] * num_ops
 
-        if self.pipe:
-            async with self.pipe:
+        try:
+            if self.pipe:
+                async with self.pipe:
+                    await self._execute_batch(grouped_ops, results)
+            else:
                 await self._execute_batch(grouped_ops, results)
-        else:
-            await self._execute_batch(grouped_ops, results)
+        except Exception as exc:
+            _log_audit_event(
+                "abatch_error",
+                trace_id,
+                op_types=op_types,
+                num_ops=num_ops,
+                input_hash=input_hash,
+                extra={"error": str(exc)},
+            )
+            raise
+
+        _log_audit_event(
+            "abatch_complete",
+            trace_id,
+            op_types=op_types,
+            num_ops=num_ops,
+            input_hash=input_hash,
+            extra={"result_count": len(results)},
+        )
 
         return results
 
@@ -413,8 +536,20 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
     ) -> None:
         # Keep `conn` for compatibility with subclasses overriding this private hook.
         # All database I/O goes through `_cursor()`, which owns connection acquisition.
+        trace_id = _make_trace_id()
+        _log_audit_event(
+            "execute_batch_start",
+            trace_id,
+            op_types=[k.__name__ for k in grouped_ops],
+            num_ops=sum(len(v) for v in grouped_ops.values()),
+        )
         async with self._cursor(pipeline=True) as cur:
             if GetOp in grouped_ops:
+                _log_audit_event(
+                    "batch_get_ops",
+                    trace_id,
+                    num_ops=len(grouped_ops[GetOp]),
+                )
                 await self._batch_get_ops(
                     cast(Sequence[tuple[int, GetOp]], grouped_ops[GetOp]),
                     results,
@@ -422,6 +557,13 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                 )
 
             if SearchOp in grouped_ops:
+                _model_id = getattr(self.embeddings, "model", None) or getattr(self.embeddings, "model_name", None) if self.embeddings else None
+                _log_audit_event(
+                    "batch_search_ops",
+                    trace_id,
+                    num_ops=len(grouped_ops[SearchOp]),
+                    model_id=str(_model_id) if _model_id else None,
+                )
                 await self._batch_search_ops(
                     cast(Sequence[tuple[int, SearchOp]], grouped_ops[SearchOp]),
                     results,
@@ -429,6 +571,11 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                 )
 
             if ListNamespacesOp in grouped_ops:
+                _log_audit_event(
+                    "batch_list_namespaces_ops",
+                    trace_id,
+                    num_ops=len(grouped_ops[ListNamespacesOp]),
+                )
                 await self._batch_list_namespaces_ops(
                     cast(
                         Sequence[tuple[int, ListNamespacesOp]],
@@ -439,10 +586,21 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                 )
 
             if PutOp in grouped_ops:
+                _log_audit_event(
+                    "batch_put_ops",
+                    trace_id,
+                    num_ops=len(grouped_ops[PutOp]),
+                )
                 await self._batch_put_ops(
                     cast(Sequence[tuple[int, PutOp]], grouped_ops[PutOp]),
                     cur,
                 )
+
+        _log_audit_event(
+            "execute_batch_complete",
+            trace_id,
+            op_types=[k.__name__ for k in grouped_ops],
+        )
 
     async def _batch_get_ops(
         self,
@@ -479,6 +637,14 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                     f"Please provide an EmbeddingConfig when initializing the {self.__class__.__name__}."
                 )
             query, txt_params = embedding_request
+            _model_id = getattr(self.embeddings, "model", None) or getattr(self.embeddings, "model_name", None)
+            _log_audit_event(
+                "embedding_invoked",
+                _make_trace_id(),
+                num_ops=len(txt_params),
+                model_id=str(_model_id) if _model_id else None,
+                extra={"operation": "put"},
+            )
             vectors = await self.embeddings.aembed_documents(
                 [param[-1] for param in txt_params]
             )
@@ -507,6 +673,14 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
         queries, embedding_requests = self._prepare_batch_search_queries(search_ops)
 
         if embedding_requests and self.embeddings:
+            _model_id = getattr(self.embeddings, "model", None) or getattr(self.embeddings, "model_name", None)
+            _log_audit_event(
+                "embedding_invoked",
+                _make_trace_id(),
+                num_ops=len(embedding_requests),
+                model_id=str(_model_id) if _model_id else None,
+                extra={"operation": "search"},
+            )
             vectors = await self.embeddings.aembed_documents(
                 [query for _, query in embedding_requests]
             )

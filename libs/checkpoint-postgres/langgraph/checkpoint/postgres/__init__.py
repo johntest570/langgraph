@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import threading
+import uuid
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -35,6 +39,55 @@ from langgraph.checkpoint.postgres.base import (
 from langgraph.checkpoint.postgres.shallow import ShallowPostgresSaver
 
 Conn = _internal.Conn  # For backward compatibility
+
+logger = logging.getLogger(__name__)
+
+# Allowed metadata keys returned to callers — enforces output data minimisation.
+_METADATA_ALLOWLIST = {"source", "step", "writes", "parents"}
+
+
+def _minimise_metadata(metadata: dict | None) -> dict:
+    """Return only allowlisted keys from checkpoint metadata."""
+    if not metadata:
+        return {}
+    return {k: v for k, v in metadata.items() if k in _METADATA_ALLOWLIST}
+
+
+def _hash_value(value: Any) -> str:
+    """Return a stable SHA-256 hex digest of the repr of *value*."""
+    try:
+        raw = repr(value).encode("utf-8", errors="replace")
+    except Exception:
+        raw = b"<unrepresentable>"
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _audit_log(
+    operation: str,
+    thread_id: str,
+    checkpoint_ns: str,
+    checkpoint_id: str | None,
+    *,
+    trace_id: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Emit a structured audit record to the audit logger."""
+    record: dict[str, Any] = {
+        "audit": True,
+        "operation": operation,
+        "thread_id": thread_id,
+        "checkpoint_ns": checkpoint_ns,
+        "checkpoint_id": checkpoint_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if trace_id is not None:
+        record["trace_id"] = trace_id
+    if extra:
+        record.update(extra)
+    try:
+        logger.info("AUDIT %s", record)
+    except Exception:
+        pass  # Never let audit logging break the critical path
 
 
 class PostgresSaver(BasePostgresSaver):
@@ -108,6 +161,7 @@ class PostgresSaver(BasePostgresSaver):
                 cur.execute("INSERT INTO checkpoint_migrations (v) VALUES (%s)", (v,))
         if self.pipe:
             self.pipe.sync()
+        _audit_log("setup", "", "", None)
 
     def list(
         self,
@@ -149,6 +203,16 @@ class PostgresSaver(BasePostgresSaver):
             >>> print(checkpoints)
             [CheckpointTuple(...), ...]
         """
+        trace_id = str(uuid.uuid4())
+        thread_id = config["configurable"]["thread_id"] if config else ""
+        _audit_log(
+            "list",
+            thread_id,
+            config["configurable"].get("checkpoint_ns", "") if config else "",
+            None,
+            trace_id=trace_id,
+            extra={"limit": limit},
+        )
         where, args = self._search_where(config, filter, before)
         query = self.SELECT_SQL + where + " ORDER BY checkpoint_id DESC"
         params = list(args)
@@ -187,6 +251,13 @@ class PostgresSaver(BasePostgresSaver):
                             value["channel_values"],
                         )
             for value in values:
+                _audit_log(
+                    "list_yield",
+                    value["thread_id"],
+                    value["checkpoint_ns"],
+                    value["checkpoint_id"],
+                    trace_id=trace_id,
+                )
                 yield self._load_checkpoint_tuple(value)
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
@@ -227,6 +298,14 @@ class PostgresSaver(BasePostgresSaver):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+        trace_id = str(uuid.uuid4())
+        _audit_log(
+            "get_tuple",
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id,
+            trace_id=trace_id,
+        )
         if checkpoint_id:
             args: tuple[Any, ...] = (thread_id, checkpoint_ns, checkpoint_id)
             where = "WHERE thread_id = %s AND checkpoint_ns = %s AND checkpoint_id = %s"
@@ -296,6 +375,21 @@ class PostgresSaver(BasePostgresSaver):
         thread_id = configurable.pop("thread_id")
         checkpoint_ns = configurable.pop("checkpoint_ns")
         checkpoint_id = configurable.pop("checkpoint_id", None)
+        trace_id = str(uuid.uuid4())
+        _audit_log(
+            "put",
+            thread_id,
+            checkpoint_ns,
+            checkpoint["id"],
+            trace_id=trace_id,
+            extra={
+                "parent_checkpoint_id": checkpoint_id,
+                "checkpoint_v": checkpoint.get("v"),
+                "channel_keys": sorted(checkpoint.get("channel_values", {}).keys()),
+                "new_version_keys": sorted(new_versions.keys()),
+                "metadata_hash": _hash_value(metadata),
+            },
+        )
         copy = checkpoint.copy()
         copy["channel_values"] = copy["channel_values"].copy()
         next_config = {
@@ -360,6 +454,23 @@ class PostgresSaver(BasePostgresSaver):
             writes: List of writes to store.
             task_id: Identifier for the task creating the writes.
         """
+        thread_id = config["configurable"]["thread_id"]
+        checkpoint_ns = config["configurable"]["checkpoint_ns"]
+        checkpoint_id = config["configurable"]["checkpoint_id"]
+        trace_id = str(uuid.uuid4())
+        _audit_log(
+            "put_writes",
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id,
+            trace_id=trace_id,
+            extra={
+                "task_id": task_id,
+                "task_path": task_path,
+                "write_channels": [w[0] for w in writes],
+                "write_count": len(writes),
+            },
+        )
         query = (
             self.UPSERT_CHECKPOINT_WRITES_SQL
             if all(w[0] in WRITES_IDX_MAP for w in writes)
@@ -369,9 +480,9 @@ class PostgresSaver(BasePostgresSaver):
             cur.executemany(
                 query,
                 self._dump_writes(
-                    config["configurable"]["thread_id"],
-                    config["configurable"]["checkpoint_ns"],
-                    config["configurable"]["checkpoint_id"],
+                    thread_id,
+                    checkpoint_ns,
+                    checkpoint_id,
                     task_id,
                     task_path,
                     writes,
@@ -387,6 +498,14 @@ class PostgresSaver(BasePostgresSaver):
         Returns:
             None
         """
+        trace_id = str(uuid.uuid4())
+        _audit_log(
+            "delete_thread",
+            thread_id,
+            "",
+            None,
+            trace_id=trace_id,
+        )
         with self._cursor(pipeline=True) as cur:
             cur.execute(
                 "DELETE FROM checkpoints WHERE thread_id = %s",
@@ -467,6 +586,15 @@ class PostgresSaver(BasePostgresSaver):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         checkpoint_id = get_checkpoint_id(config)
+        trace_id = str(uuid.uuid4())
+        _audit_log(
+            "get_delta_channel_history_start",
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id,
+            trace_id=trace_id,
+            extra={"channels": channels},
+        )
         if checkpoint_id is None:
             target = self.get_tuple(config)
             if target is None:
@@ -521,6 +649,15 @@ class PostgresSaver(BasePostgresSaver):
                     break
                 cursor = oldest
 
+        _audit_log(
+            "get_delta_channel_history_stage1_complete",
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id,
+            trace_id=trace_id,
+            extra={"seeded_channels": list(seeded), "chain_lengths": {ch: len(chain_by_ch[ch]) for ch in channels}},
+        )
+
         # Stage 2: per-channel UNION ALL — one writes branch per channel
         # with non-empty chain, plus one blob branch per seeded channel.
         channels_with_chain = [ch for ch in channels if chain_by_ch[ch]]
@@ -542,6 +679,15 @@ class PostgresSaver(BasePostgresSaver):
         else:
             stage2_rows = []
 
+        _audit_log(
+            "get_delta_channel_history_stage2_complete",
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id,
+            trace_id=trace_id,
+            extra={"stage2_row_count": len(stage2_rows)},
+        )
+
         return self._build_delta_channels_writes_history(
             channels=channels,
             chain_by_ch=chain_by_ch,
@@ -561,6 +707,9 @@ class PostgresSaver(BasePostgresSaver):
             including its configuration, metadata, parent checkpoint (if any),
             and pending writes.
         """
+        # Apply output data minimisation: only expose allowlisted metadata keys.
+        minimised_metadata = _minimise_metadata(value["metadata"])
+
         return CheckpointTuple(
             {
                 "configurable": {
@@ -576,7 +725,7 @@ class PostgresSaver(BasePostgresSaver):
                     **self._load_blobs(value["channel_values"]),
                 },
             },
-            value["metadata"],
+            minimised_metadata,
             (
                 {
                     "configurable": {

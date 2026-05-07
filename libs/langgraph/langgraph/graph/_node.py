@@ -2,15 +2,42 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, Protocol, TypeAlias
-
-from langchain_core.runnables import Runnable, RunnableConfig
-from langgraph.store.base import BaseStore
+from typing import Any, Generic, Protocol, TypeAlias, runtime_checkable
 
 from langgraph._internal._typing import EMPTY_SEQ
 from langgraph.runtime import Runtime
 from langgraph.types import CachePolicy, RetryPolicy, StreamWriter, TimeoutPolicy
 from langgraph.typing import ContextT, NodeInputT, NodeInputT_contra
+
+try:
+    from typing import NotRequired
+except ImportError:
+    from typing_extensions import NotRequired
+
+from typing import TypedDict
+
+
+class RunnableConfig(TypedDict, total=False):
+    tags: list[str]
+    metadata: dict[str, Any]
+    callbacks: Any
+    run_name: str
+    max_concurrency: NotRequired[int | None]
+    recursion_limit: int
+    configurable: dict[str, Any]
+    run_id: Any
+
+
+@runtime_checkable
+class BaseStore(Protocol):
+    def get(self, namespace: tuple[str, ...], key: str) -> Any: ...
+    def put(self, namespace: tuple[str, ...], key: str, value: dict[str, Any]) -> None: ...
+    def delete(self, namespace: tuple[str, ...], key: str) -> None: ...
+    def search(self, namespace_prefix: tuple[str, ...], **kwargs: Any) -> list[Any]: ...
+
+
+class Runnable(Protocol[NodeInputT_contra, Any]):
+    def invoke(self, input: NodeInputT_contra, config: RunnableConfig | None = None) -> Any: ...
 
 
 class _Node(Protocol[NodeInputT_contra]):

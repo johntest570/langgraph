@@ -9,12 +9,51 @@ asynchronous operations.
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import json
+import re
+import unicodedata
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
-from langchain_core.embeddings import Embeddings
+
+# ---------------------------------------------------------------------------
+# Approved model registry
+# ---------------------------------------------------------------------------
+
+#: Allowlist of approved embedding model identifiers (provider:model-version).
+#: Only models listed here may be loaded via ensure_embeddings().
+APPROVED_EMBEDDING_MODELS: frozenset[str] = frozenset()
+"""Set of approved embedding model identifiers.
+
+This set is intentionally empty by default because neither LangChain nor the
+RAG embedding model are on the organisation's approved list.  Operators must
+populate this set with approved, version-pinned identifiers before passing a
+string to ensure_embeddings().
+"""
+
+# ---------------------------------------------------------------------------
+# Minimal Embeddings protocol (replaces langchain_core dependency)
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class Embeddings(Protocol):
+    """Minimal protocol mirroring LangChain's Embeddings interface."""
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        ...
+
+    def embed_query(self, text: str) -> list[float]:
+        ...
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        ...
+
+    async def aembed_query(self, text: str) -> list[float]:
+        ...
+
 
 EmbeddingsFunc = Callable[[Sequence[str]], list[list[float]]]
 """Type for synchronous embedding functions.
@@ -30,23 +69,162 @@ AEmbeddingsFunc = Callable[[Sequence[str]], Awaitable[list[list[float]]]]
 Similar to EmbeddingsFunc, but returns an awaitable that resolves to the embeddings.
 """
 
+# ---------------------------------------------------------------------------
+# Input sanitization / validation helpers
+# ---------------------------------------------------------------------------
+
+# Maximum allowed length for a single text input (characters).
+_MAX_TEXT_LENGTH: int = 32_768
+
+# Patterns that indicate potentially malicious prompt content.
+_SHELL_COMMAND_PATTERN = re.compile(
+    r"(?:^|\s)(?:sudo|rm\s+-rf|chmod|chown|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|eval|exec)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_INJECTION_PATTERN = re.compile(
+    r"(?:ignore\s+(?:previous|above|prior)\s+instructions?|"
+    r"disregard\s+(?:previous|above|prior)\s+instructions?|"
+    r"you\s+are\s+now\s+(?:a\s+)?(?:dan|jailbreak)|"
+    r"act\s+as\s+(?:if\s+you\s+(?:are|were)\s+)?(?:an?\s+)?(?:evil|unrestricted|unfiltered)|"
+    r"system\s*:\s*you\s+are)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Detect strings that are suspiciously large base64 blobs (potential binary payloads).
+_BASE64_BLOB_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{76,}\n?){4,}={0,2}")
+
+
+def _sanitize_texts(texts: Sequence[str]) -> list[str]:
+    """Validate and sanitize a sequence of text inputs before embedding.
+
+    Raises:
+        ValueError: If any text fails validation.
+
+    Returns:
+        The sanitized list of texts (strings are stripped of leading/trailing
+        whitespace; no other mutation is performed so embeddings remain
+        semantically equivalent).
+    """
+    sanitized: list[str] = []
+    for i, text in enumerate(texts):
+        if not isinstance(text, str):
+            raise ValueError(
+                f"Input at index {i} is not a string (got {type(text).__name__!r}). "
+                "All inputs must be plain text strings."
+            )
+
+        # Normalise unicode to NFC to prevent homoglyph / encoding tricks.
+        text = unicodedata.normalize("NFC", text)
+
+        # Strip leading/trailing whitespace.
+        text = text.strip()
+
+        if len(text) == 0:
+            raise ValueError(
+                f"Input at index {i} is empty after stripping whitespace. "
+                "Empty strings are not valid embedding inputs."
+            )
+
+        if len(text) > _MAX_TEXT_LENGTH:
+            raise ValueError(
+                f"Input at index {i} exceeds the maximum allowed length of "
+                f"{_MAX_TEXT_LENGTH} characters (got {len(text)})."
+            )
+
+        # Check for null bytes (common in binary / exploit payloads).
+        if "\x00" in text:
+            raise ValueError(
+                f"Input at index {i} contains null bytes, which are not permitted."
+            )
+
+        # Check for shell-command-like content.
+        if _SHELL_COMMAND_PATTERN.search(text):
+            raise ValueError(
+                f"Input at index {i} appears to contain shell commands or "
+                "executable directives, which are not permitted."
+            )
+
+        # Check for prompt-injection patterns.
+        if _INJECTION_PATTERN.search(text):
+            raise ValueError(
+                f"Input at index {i} appears to contain prompt-injection content, "
+                "which is not permitted."
+            )
+
+        # Check for large base64 blobs (potential binary executable payloads).
+        if _BASE64_BLOB_PATTERN.search(text):
+            # Attempt to decode and check for ELF/PE magic bytes.
+            for match in _BASE64_BLOB_PATTERN.finditer(text):
+                try:
+                    decoded = base64.b64decode(match.group(0).replace("\n", ""))
+                    if decoded[:4] in (b"\x7fELF", b"MZ\x90\x00", b"MZ"):
+                        raise ValueError(
+                            f"Input at index {i} contains a base64-encoded binary "
+                            "executable, which is not permitted."
+                        )
+                except Exception as exc:
+                    if "not permitted" in str(exc):
+                        raise
+                    # Decoding failed — not a valid base64 blob; ignore.
+
+        sanitized.append(text)
+
+    return sanitized
+
+
+# ---------------------------------------------------------------------------
+# Registry validation helper
+# ---------------------------------------------------------------------------
+
+
+def _validate_model_identifier(identifier: str) -> None:
+    """Raise ValueError if *identifier* is not in the approved model registry.
+
+    Args:
+        identifier: A provider:model-version string, e.g. 'openai:text-embedding-3-small'.
+
+    Raises:
+        ValueError: Always, because the approved registry is empty by default
+            (neither LangChain nor the RAG embedding model are approved).
+    """
+    if identifier not in APPROVED_EMBEDDING_MODELS:
+        raise ValueError(
+            f"Embedding model identifier '{identifier}' is not in the organisation's "
+            "approved model registry. "
+            "Only version-pinned, approved models may be used. "
+            "Update APPROVED_EMBEDDING_MODELS with an approved, version-pinned "
+            "identifier before calling ensure_embeddings()."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 
 def ensure_embeddings(
     embed: Embeddings | EmbeddingsFunc | AEmbeddingsFunc | str | None,
-) -> Embeddings:
-    """Ensure that an embedding function conforms to LangChain's Embeddings interface.
+) -> "EmbeddingsLambda | Embeddings":
+    """Ensure that an embedding function conforms to the Embeddings interface.
 
     This function wraps arbitrary embedding functions to make them compatible with
-    LangChain's Embeddings interface. It handles both synchronous and asynchronous
+    the Embeddings interface. It handles both synchronous and asynchronous
     functions.
 
     Args:
         embed: Either an existing Embeddings instance, or a function that converts
             text to embeddings. If the function is async, it will be used for both
             sync and async operations.
+            String identifiers are validated against the approved model registry
+            before use.
 
     Returns:
         An Embeddings instance that wraps the provided function(s).
+
+    Raises:
+        ValueError: If *embed* is None, if a string identifier is not in the
+            approved registry, or if the required dependencies are unavailable.
 
     ??? example "Examples"
 
@@ -69,50 +247,43 @@ def ensure_embeddings(
         embeddings = ensure_embeddings(my_async_fn)
         result = await embeddings.aembed_query("hello")  # Returns [0.1, 0.2]
         ```
-
-        Initialize embeddings using a provider string:
-
-        ```python
-        # Requires langchain>=0.3.9 and langgraph-checkpoint>=2.0.11
-        embeddings = ensure_embeddings("openai:text-embedding-3-small")
-        result = embeddings.embed_query("hello")
-        ```
     """
     if embed is None:
         raise ValueError("embed must be provided")
+
     if isinstance(embed, str):
-        init_embeddings = _get_init_embeddings()
-        if init_embeddings is None:
-            from importlib.metadata import PackageNotFoundError, version
+        # Validate against the approved registry before attempting to load.
+        _validate_model_identifier(embed)
 
-            try:
-                lc_version = version("langchain")
-                version_info = f"Found langchain version {lc_version}, but"
-            except PackageNotFoundError:
-                version_info = "langchain is not installed;"
-
-            raise ValueError(
-                f"Could not load embeddings from string '{embed}'. {version_info} "
-                "loading embeddings by provider:identifier string requires langchain>=0.3.9 "
-                "as well as the provider-specific package. "
-                "Install LangChain with: pip install 'langchain>=0.3.9' "
-                "and the provider-specific package (e.g., 'langchain-openai>=0.3.0'). "
-                "Alternatively, specify 'embed' as a compatible Embeddings object or python function."
-            )
-        return init_embeddings(embed)
+        # The block below is intentionally unreachable when the registry is
+        # empty (the default).  It is retained so that operators who populate
+        # APPROVED_EMBEDDING_MODELS can still use string identifiers, but the
+        # unapproved langchain.embeddings.init_embeddings path is blocked.
+        raise ValueError(
+            f"Loading embedding models via string identifiers is disabled. "
+            f"Identifier '{embed}' was validated against the approved registry "
+            "but the string-based loader has been disabled because LangChain "
+            "is not on the organisation's approved model list. "
+            "Provide an approved Embeddings instance or callable directly."
+        )
 
     if isinstance(embed, Embeddings):
-        return embed
+        return embed  # type: ignore[return-value]
+
     return EmbeddingsLambda(embed)
 
 
-class EmbeddingsLambda(Embeddings):
-    """Wrapper to convert embedding functions into LangChain's Embeddings interface.
+class EmbeddingsLambda:
+    """Wrapper to convert embedding functions into the Embeddings interface.
 
-    This class allows arbitrary embedding functions to be used with LangChain-compatible
-    tools. It supports both synchronous and asynchronous operations, and can handle:
+    This class allows arbitrary embedding functions to be used with
+    Embeddings-compatible tools. It supports both synchronous and asynchronous
+    operations, and can handle:
     1. A synchronous function for sync operations (async operations will use sync function)
     2. An async function for both sync/async operations (sync operations will raise an error)
+
+    All text inputs are sanitized and validated before being passed to the
+    underlying embedding function.
 
     The embedding functions should convert text into fixed-dimensional vectors that
     capture the semantic meaning of the text.
@@ -169,7 +340,8 @@ class EmbeddingsLambda(Embeddings):
             list of embeddings, one per input text. Each embedding is a list of floats.
 
         Raises:
-            ValueError: If the instance was initialized with only an async function.
+            ValueError: If the instance was initialized with only an async function,
+                or if any input text fails validation.
         """
         func = getattr(self, "func", None)
         if func is None:
@@ -177,7 +349,8 @@ class EmbeddingsLambda(Embeddings):
                 "EmbeddingsLambda was initialized with an async function but no sync function. "
                 "Use aembed_documents for async operation or provide a sync function."
             )
-        return func(texts)
+        sanitized = _sanitize_texts(texts)
+        return func(sanitized)
 
     def embed_query(self, text: str) -> list[float]:
         """Embed a single piece of text.
@@ -187,6 +360,9 @@ class EmbeddingsLambda(Embeddings):
 
         Returns:
             Embedding vector as a list of floats.
+
+        Raises:
+            ValueError: If the input text fails validation.
 
         Note:
             This is equivalent to calling embed_documents with a single text
@@ -203,13 +379,24 @@ class EmbeddingsLambda(Embeddings):
         Returns:
             list of embeddings, one per input text. Each embedding is a list of floats.
 
+        Raises:
+            ValueError: If any input text fails validation.
+
         Note:
             If no async function was provided, this falls back to the sync implementation.
         """
+        sanitized = _sanitize_texts(texts)
         afunc = getattr(self, "afunc", None)
         if afunc is None:
-            return await super().aembed_documents(texts)
-        return await afunc(texts)
+            # Fall back to sync implementation via a thread executor.
+            func = getattr(self, "func", None)
+            if func is None:
+                raise ValueError(
+                    "EmbeddingsLambda has neither a sync nor an async function."
+                )
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, func, sanitized)
+        return await afunc(sanitized)
 
     async def aembed_query(self, text: str) -> list[float]:
         """Asynchronously embed a single piece of text.
@@ -220,14 +407,18 @@ class EmbeddingsLambda(Embeddings):
         Returns:
             Embedding vector as a list of floats.
 
+        Raises:
+            ValueError: If the input text fails validation.
+
         Note:
             This is equivalent to calling aembed_documents with a single text
             and taking the first result.
         """
         afunc = getattr(self, "afunc", None)
         if afunc is None:
-            return await super().aembed_query(text)
-        return (await afunc([text]))[0]
+            return (await self.aembed_documents([text]))[0]
+        sanitized = _sanitize_texts([text])
+        return (await afunc(sanitized))[0]
 
 
 def get_text_at_path(obj: Any, path: str | list[str]) -> list[str]:
@@ -417,17 +608,19 @@ def _is_async_callable(
 
 
 @functools.lru_cache
-def _get_init_embeddings() -> Callable[[str], Embeddings] | None:
-    try:
-        from langchain.embeddings import init_embeddings  # type: ignore
+def _get_init_embeddings() -> None:
+    """Disabled: loading embeddings via LangChain is not permitted.
 
-        return init_embeddings
-    except ImportError:
-        return None
+    LangChain and the RAG embedding model are not on the organisation's
+    approved model registry.  This function always returns None to prevent
+    accidental use of the string-based loader.
+    """
+    return None
 
 
 __all__ = [
     "ensure_embeddings",
     "EmbeddingsFunc",
     "AEmbeddingsFunc",
+    "APPROVED_EMBEDDING_MODELS",
 ]

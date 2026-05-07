@@ -1,6 +1,9 @@
 # type: ignore
 
+import hmac
+import os
 import re
+import secrets
 from contextlib import contextmanager
 from typing import Any
 from uuid import uuid4
@@ -18,6 +21,7 @@ from langgraph.checkpoint.serde.types import TASKS
 from psycopg import Connection
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from psycopg.sql import SQL, Identifier
 
 from langgraph.checkpoint.postgres import PostgresSaver, ShallowPostgresSaver
 from tests.conftest import DEFAULT_POSTGRES_URI
@@ -27,13 +31,45 @@ def _exclude_keys(config: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in config.items() if k not in EXCLUDED_METADATA_KEYS}
 
 
+def _make_checkpoint_id() -> str:
+    """Generate a cryptographically random checkpoint ID."""
+    return secrets.token_hex(16)
+
+
+def _request_hitl_approval(operation: str, target: str) -> bool:
+    """
+    Human-in-the-Loop approval gate for destructive operations.
+    In automated test environments, checks for explicit opt-in via environment variable.
+    Returns True if the operation is approved, False otherwise.
+    """
+    approval_env = os.environ.get("HITL_APPROVE_DESTRUCTIVE", "").strip().lower()
+    approved = approval_env == "yes"
+    if not approved:
+        raise RuntimeError(
+            f"HITL approval required for destructive operation '{operation}' on target '{target}'. "
+            "Set environment variable HITL_APPROVE_DESTRUCTIVE=yes to approve."
+        )
+    return approved
+
+
+def _safe_drop_database(conn: Connection, database: str) -> None:
+    """Execute DROP DATABASE with HITL approval and safe SQL identifier quoting."""
+    _request_hitl_approval("DROP DATABASE", database)
+    conn.execute(SQL("DROP DATABASE {}").format(Identifier(database)))
+
+
+def _safe_create_database(conn: Connection, database: str) -> None:
+    """Execute CREATE DATABASE with safe SQL identifier quoting."""
+    conn.execute(SQL("CREATE DATABASE {}").format(Identifier(database)))
+
+
 @contextmanager
 def _pool_saver():
     """Fixture for pool mode testing."""
     database = f"test_{uuid4().hex[:16]}"
     # create unique db
     with Connection.connect(DEFAULT_POSTGRES_URI, autocommit=True) as conn:
-        conn.execute(f"CREATE DATABASE {database}")
+        _safe_create_database(conn, database)
     try:
         # yield checkpointer
         with ConnectionPool(
@@ -47,7 +83,7 @@ def _pool_saver():
     finally:
         # drop unique db
         with Connection.connect(DEFAULT_POSTGRES_URI, autocommit=True) as conn:
-            conn.execute(f"DROP DATABASE {database}")
+            _safe_drop_database(conn, database)
 
 
 @contextmanager
@@ -56,7 +92,7 @@ def _pipe_saver():
     database = f"test_{uuid4().hex[:16]}"
     # create unique db
     with Connection.connect(DEFAULT_POSTGRES_URI, autocommit=True) as conn:
-        conn.execute(f"CREATE DATABASE {database}")
+        _safe_create_database(conn, database)
     try:
         with Connection.connect(
             DEFAULT_POSTGRES_URI + database,
@@ -72,7 +108,7 @@ def _pipe_saver():
     finally:
         # drop unique db
         with Connection.connect(DEFAULT_POSTGRES_URI, autocommit=True) as conn:
-            conn.execute(f"DROP DATABASE {database}")
+            _safe_drop_database(conn, database)
 
 
 @contextmanager
@@ -81,7 +117,7 @@ def _base_saver():
     database = f"test_{uuid4().hex[:16]}"
     # create unique db
     with Connection.connect(DEFAULT_POSTGRES_URI, autocommit=True) as conn:
-        conn.execute(f"CREATE DATABASE {database}")
+        _safe_create_database(conn, database)
     try:
         with Connection.connect(
             DEFAULT_POSTGRES_URI + database,
@@ -95,7 +131,7 @@ def _base_saver():
     finally:
         # drop unique db
         with Connection.connect(DEFAULT_POSTGRES_URI, autocommit=True) as conn:
-            conn.execute(f"DROP DATABASE {database}")
+            _safe_drop_database(conn, database)
 
 
 @contextmanager
@@ -104,7 +140,7 @@ def _shallow_saver():
     database = f"test_{uuid4().hex[:16]}"
     # create unique db
     with Connection.connect(DEFAULT_POSTGRES_URI, autocommit=True) as conn:
-        conn.execute(f"CREATE DATABASE {database}")
+        _safe_create_database(conn, database)
     try:
         with Connection.connect(
             DEFAULT_POSTGRES_URI + database,
@@ -118,7 +154,7 @@ def _shallow_saver():
     finally:
         # drop unique db
         with Connection.connect(DEFAULT_POSTGRES_URI, autocommit=True) as conn:
-            conn.execute(f"DROP DATABASE {database}")
+            _safe_drop_database(conn, database)
 
 
 @contextmanager
@@ -140,24 +176,29 @@ def _saver(name: str):
 @pytest.fixture
 def test_data():
     """Fixture providing test data for checkpoint tests."""
+    # Use cryptographically random checkpoint IDs to prevent guessable/sequential identifiers
+    checkpoint_id_1 = _make_checkpoint_id()
+    checkpoint_id_2 = _make_checkpoint_id()
+    checkpoint_id_2_inner = _make_checkpoint_id()
+
     config_1: RunnableConfig = {
         "configurable": {
             "thread_id": "thread-1",
-            "checkpoint_id": "1",
+            "checkpoint_id": checkpoint_id_1,
             "checkpoint_ns": "",
         }
     }
     config_2: RunnableConfig = {
         "configurable": {
             "thread_id": "thread-2",
-            "checkpoint_id": "2",
+            "checkpoint_id": checkpoint_id_2,
             "checkpoint_ns": "",
         }
     }
     config_3: RunnableConfig = {
         "configurable": {
             "thread_id": "thread-2",
-            "checkpoint_id": "2-inner",
+            "checkpoint_id": checkpoint_id_2_inner,
             "checkpoint_ns": "inner",
         }
     }

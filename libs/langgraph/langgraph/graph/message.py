@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 import warnings
 from collections.abc import Callable, Sequence
@@ -23,7 +24,7 @@ from langchain_core.messages import (
 from typing_extensions import TypedDict, deprecated
 
 from langgraph._internal._constants import CONF, CONFIG_KEY_SEND, NS_SEP
-from langgraph.graph.state import StateGraph
+from .state import StateGraph
 from langgraph.warnings import LangGraphDeprecatedSinceV10
 
 __all__ = (
@@ -36,6 +37,61 @@ __all__ = (
 Messages = list[MessageLikeRepresentation] | MessageLikeRepresentation
 
 REMOVE_ALL_MESSAGES = "__remove_all__"
+
+_MAX_MESSAGE_LENGTH = 100_000
+_DANGEROUS_PATTERNS = re.compile(
+    r"(\x00"
+    r"|ignore previous instructions"
+    r"|ignore all previous"
+    r"|disregard previous"
+    r"|forget previous instructions"
+    r"|you are now"
+    r"|act as"
+    r"|jailbreak"
+    r"|prompt injection"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_message_content(content: Any) -> Any:
+    """Strip potentially dangerous content from message text.
+
+    Removes null bytes, prompt injection patterns, and truncates
+    excessively long content.
+    """
+    if isinstance(content, str):
+        sanitized = content.replace("\x00", "")
+        sanitized = _DANGEROUS_PATTERNS.sub("", sanitized)
+        if len(sanitized) > _MAX_MESSAGE_LENGTH:
+            sanitized = sanitized[:_MAX_MESSAGE_LENGTH]
+        return sanitized
+    elif isinstance(content, list):
+        sanitized_list = []
+        for item in content:
+            if isinstance(item, dict):
+                sanitized_item = {}
+                for k, v in item.items():
+                    if isinstance(v, str):
+                        sanitized_item[k] = _sanitize_message_content(v)
+                    else:
+                        sanitized_item[k] = v
+                sanitized_list.append(sanitized_item)
+            elif isinstance(item, str):
+                sanitized_list.append(_sanitize_message_content(item))
+            else:
+                sanitized_list.append(item)
+        return sanitized_list
+    return content
+
+
+def _sanitize_message(message: AnyMessage) -> AnyMessage:
+    """Apply sanitization to a message's content in place."""
+    if isinstance(message, BaseMessage):
+        sanitized_content = _sanitize_message_content(message.content)
+        if sanitized_content != message.content:
+            message.content = sanitized_content
+    return message
 
 
 def _add_messages_wrapper(func: Callable) -> Callable[[Messages, Messages], Messages]:
@@ -199,6 +255,9 @@ def add_messages(
         message_chunk_to_message(cast(BaseMessageChunk, m))
         for m in convert_to_messages(right)
     ]
+    # sanitize message content
+    left = [_sanitize_message(m) for m in left]
+    right = [_sanitize_message(m) for m in right]
     # assign missing ids
     for m in left:
         if m.id is None:
@@ -412,6 +471,9 @@ def push_message(
 
     if message.id is None:
         raise ValueError("Message ID is required")
+
+    # sanitize message content before sending to state channel
+    message = _sanitize_message(message)
 
     if isinstance(config["callbacks"], BaseCallbackManager):
         manager = config["callbacks"]

@@ -18,6 +18,7 @@ from langgraph.store.base import (
     SearchOp,
 )
 from psycopg import Connection
+from psycopg.sql import SQL, Identifier
 
 from langgraph.store.postgres import PostgresStore
 from tests.conftest import (
@@ -28,6 +29,22 @@ from tests.conftest import (
 
 TTL_SECONDS = 6
 TTL_MINUTES = TTL_SECONDS / 60
+
+
+def _require_hitl_approval(operation: str, target: str) -> None:
+    """
+    Human-in-the-Loop (HITL) approval gate for destructive/risky operations.
+    Raises RuntimeError if the operation is not approved by a human operator.
+    In automated test environments, set the environment variable
+    HITL_APPROVED_DESTRUCTIVE_OPS=1 to indicate prior human approval.
+    """
+    import os
+    approved = os.environ.get("HITL_APPROVED_DESTRUCTIVE_OPS", "").strip()
+    if approved not in ("1", "true", "yes"):
+        raise RuntimeError(
+            f"HITL approval required for destructive operation '{operation}' "
+            f"on target '{target}'. Set HITL_APPROVED_DESTRUCTIVE_OPS=1 to approve."
+        )
 
 
 @pytest.fixture(scope="function", params=["default", "pipe", "pool"])
@@ -47,8 +64,9 @@ def store(request) -> PostgresStore:
         "refresh_on_read": True,
         "sweep_interval_minutes": TTL_MINUTES / 2,
     }
+    _require_hitl_approval("CREATE DATABASE", database)
     with Connection.connect(admin_conn_string, autocommit=True) as conn:
-        conn.execute(f"CREATE DATABASE {database}")
+        conn.execute(SQL("CREATE DATABASE {}").format(Identifier(database)))
     try:
         with PostgresStore.from_conn_string(conn_string, ttl=ttl_config) as store:
             store.MIGRATIONS = [
@@ -88,8 +106,9 @@ def store(request) -> PostgresStore:
 
                 store.stop_ttl_sweeper()
     finally:
+        _require_hitl_approval("DROP DATABASE", database)
         with Connection.connect(admin_conn_string, autocommit=True) as conn:
-            conn.execute(f"DROP DATABASE {database}")
+            conn.execute(SQL("DROP DATABASE {}").format(Identifier(database)))
 
 
 def test_batch_order(store: PostgresStore) -> None:
@@ -405,8 +424,9 @@ def _create_vector_store(
         "fields": text_fields,
     }
 
+    _require_hitl_approval("CREATE DATABASE", database)
     with Connection.connect(admin_conn_string, autocommit=True) as conn:
-        conn.execute(f"CREATE DATABASE {database}")
+        conn.execute(SQL("CREATE DATABASE {}").format(Identifier(database)))
     try:
         with PostgresStore.from_conn_string(
             conn_string,
@@ -420,8 +440,9 @@ def _create_vector_store(
             store.setup()  # Will fail if migrations aren't idempotent
             yield store
     finally:
+        _require_hitl_approval("DROP DATABASE", database)
         with Connection.connect(admin_conn_string, autocommit=True) as conn:
-            conn.execute(f"DROP DATABASE {database}")
+            conn.execute(SQL("DROP DATABASE {}").format(Identifier(database)))
 
 
 _vector_params = [

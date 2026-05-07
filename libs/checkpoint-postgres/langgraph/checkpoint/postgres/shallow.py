@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
+import logging
 import threading
 import warnings
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -31,6 +34,8 @@ from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from langgraph.checkpoint.postgres import _ainternal, _internal
 from langgraph.checkpoint.postgres.base import BasePostgresSaver
+
+logger = logging.getLogger(__name__)
 
 """
 To add a new migration, add a new string to the MIGRATIONS list.
@@ -79,7 +84,44 @@ MIGRATIONS = [
     """
     ALTER TABLE checkpoint_writes ADD COLUMN IF NOT EXISTS task_path TEXT NOT NULL DEFAULT '';
     """,
+    """CREATE TABLE IF NOT EXISTS checkpoint_audit_log (
+    audit_id BIGSERIAL PRIMARY KEY,
+    event_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+    operation TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL,
+    checkpoint_id TEXT,
+    input_hash TEXT,
+    output_hash TEXT,
+    correlation_id TEXT
+);""",
 ]
+
+# Allowlisted top-level keys returned from checkpoint JSONB to enforce data minimisation.
+_CHECKPOINT_ALLOWED_KEYS = frozenset(
+    {"id", "ts", "v", "channel_versions", "versions_seen", "pending_sends", "channel_values"}
+)
+
+# Allowlisted top-level keys returned from metadata JSONB to enforce data minimisation.
+_METADATA_ALLOWED_KEYS = frozenset(
+    {"source", "step", "writes", "parents"}
+)
+
+
+def _minimise_checkpoint(raw: dict) -> dict:
+    """Return only the allowlisted keys from a raw checkpoint dict."""
+    return {k: v for k, v in raw.items() if k in _CHECKPOINT_ALLOWED_KEYS}
+
+
+def _minimise_metadata(raw: dict) -> dict:
+    """Return only the allowlisted keys from a raw metadata dict."""
+    return {k: v for k, v in raw.items() if k in _METADATA_ALLOWED_KEYS}
+
+
+def _hash_value(value: Any) -> str:
+    """Return a stable SHA-256 hex digest of the string representation of value."""
+    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()
+
 
 SELECT_SQL = f"""
 select
@@ -144,6 +186,12 @@ INSERT_CHECKPOINT_WRITES_SQL = """
     ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id, task_id, idx) DO NOTHING
 """
 
+INSERT_AUDIT_LOG_SQL = """
+    INSERT INTO checkpoint_audit_log
+        (event_time, operation, thread_id, checkpoint_ns, checkpoint_id, input_hash, output_hash, correlation_id)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
 
 def _dump_blobs(
     serde: SerializerProtocol,
@@ -164,6 +212,15 @@ def _dump_blobs(
         )
         for k in versions
     ]
+
+
+def _get_correlation_id(config: RunnableConfig) -> str:
+    """Extract or derive a correlation ID from the config for audit trail linkage."""
+    configurable = config.get("configurable", {})
+    # Use run_id if present, otherwise derive from thread_id + checkpoint_ns
+    run_id = configurable.get("run_id") or configurable.get("thread_id", "")
+    checkpoint_ns = configurable.get("checkpoint_ns", "")
+    return f"{run_id}:{checkpoint_ns}" if checkpoint_ns else str(run_id)
 
 
 class ShallowPostgresSaver(BasePostgresSaver):
@@ -279,8 +336,10 @@ class ShallowPostgresSaver(BasePostgresSaver):
         with self._cursor() as cur:
             cur.execute(query, params, binary=True)
             for value in cur:
+                raw_checkpoint = _minimise_checkpoint(value["checkpoint"])
+                raw_metadata = _minimise_metadata(value["metadata"])
                 checkpoint: Checkpoint = {
-                    **value["checkpoint"],
+                    **raw_checkpoint,
                     "channel_values": self._load_blobs(value["channel_values"]),
                     "pending_sends": [
                         self.serde.loads_typed((t.decode(), v))
@@ -298,7 +357,7 @@ class ShallowPostgresSaver(BasePostgresSaver):
                         }
                     },
                     checkpoint=checkpoint,
-                    metadata=value["metadata"],
+                    metadata=raw_metadata,
                     pending_writes=self._load_writes(value["pending_writes"]),
                 )
 
@@ -348,8 +407,10 @@ class ShallowPostgresSaver(BasePostgresSaver):
             )
 
             for value in cur:
+                raw_checkpoint = _minimise_checkpoint(value["checkpoint"])
+                raw_metadata = _minimise_metadata(value["metadata"])
                 checkpoint: Checkpoint = {
-                    **value["checkpoint"],
+                    **raw_checkpoint,
                     "channel_values": self._load_blobs(value["channel_values"]),
                     "pending_sends": [
                         self.serde.loads_typed((t.decode(), v))
@@ -367,7 +428,7 @@ class ShallowPostgresSaver(BasePostgresSaver):
                         }
                     },
                     checkpoint=checkpoint,
-                    metadata=value["metadata"],
+                    metadata=raw_metadata,
                     pending_writes=self._load_writes(value["pending_writes"]),
                 )
 
@@ -417,6 +478,23 @@ class ShallowPostgresSaver(BasePostgresSaver):
             }
         }
 
+        input_hash = _hash_value(configurable)
+        output_hash = _hash_value(checkpoint.get("id", ""))
+        correlation_id = _get_correlation_id(config)
+        event_time = datetime.now(tz=timezone.utc)
+
+        logger.info(
+            "checkpoint.put operation=put thread_id=%s checkpoint_ns=%s checkpoint_id=%s "
+            "input_hash=%s output_hash=%s correlation_id=%s event_time=%s",
+            thread_id,
+            checkpoint_ns,
+            checkpoint.get("id", ""),
+            input_hash,
+            output_hash,
+            correlation_id,
+            event_time.isoformat(),
+        )
+
         with self._cursor(pipeline=True) as cur:
             cur.execute(
                 """DELETE FROM checkpoint_writes
@@ -447,6 +525,19 @@ class ShallowPostgresSaver(BasePostgresSaver):
                     Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
                 ),
             )
+            cur.execute(
+                INSERT_AUDIT_LOG_SQL,
+                (
+                    event_time,
+                    "put",
+                    thread_id,
+                    checkpoint_ns,
+                    checkpoint.get("id", ""),
+                    input_hash,
+                    output_hash,
+                    correlation_id,
+                ),
+            )
         return next_config
 
     def put_writes(
@@ -470,16 +561,46 @@ class ShallowPostgresSaver(BasePostgresSaver):
             if all(w[0] in WRITES_IDX_MAP for w in writes)
             else self.INSERT_CHECKPOINT_WRITES_SQL
         )
+        thread_id = config["configurable"]["thread_id"]
+        checkpoint_ns = config["configurable"]["checkpoint_ns"]
+        checkpoint_id = config["configurable"]["checkpoint_id"]
+        correlation_id = _get_correlation_id(config)
+        event_time = datetime.now(tz=timezone.utc)
+
+        logger.info(
+            "checkpoint.put_writes operation=put_writes thread_id=%s checkpoint_ns=%s "
+            "checkpoint_id=%s task_id=%s correlation_id=%s event_time=%s",
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id,
+            task_id,
+            correlation_id,
+            event_time.isoformat(),
+        )
+
         with self._cursor(pipeline=True) as cur:
             cur.executemany(
                 query,
                 self._dump_writes(
-                    config["configurable"]["thread_id"],
-                    config["configurable"]["checkpoint_ns"],
-                    config["configurable"]["checkpoint_id"],
+                    thread_id,
+                    checkpoint_ns,
+                    checkpoint_id,
                     task_id,
                     task_path,
                     writes,
+                ),
+            )
+            cur.execute(
+                INSERT_AUDIT_LOG_SQL,
+                (
+                    event_time,
+                    "put_writes",
+                    thread_id,
+                    checkpoint_ns,
+                    checkpoint_id,
+                    _hash_value(task_id),
+                    _hash_value(len(writes)),
+                    correlation_id,
                 ),
             )
 
@@ -645,8 +766,10 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
         async with self._cursor() as cur:
             await cur.execute(query, params, binary=True)
             async for value in cur:
+                raw_checkpoint = _minimise_checkpoint(value["checkpoint"])
+                raw_metadata = _minimise_metadata(value["metadata"])
                 checkpoint: Checkpoint = {
-                    **value["checkpoint"],
+                    **raw_checkpoint,
                     "channel_values": self._load_blobs(value["channel_values"]),
                     "pending_sends": [
                         self.serde.loads_typed((t.decode(), v))
@@ -664,7 +787,7 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
                         }
                     },
                     checkpoint=checkpoint,
-                    metadata=value["metadata"],
+                    metadata=raw_metadata,
                     pending_writes=await asyncio.to_thread(
                         self._load_writes, value["pending_writes"]
                     ),
@@ -695,8 +818,10 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
             )
 
             async for value in cur:
+                raw_checkpoint = _minimise_checkpoint(value["checkpoint"])
+                raw_metadata = _minimise_metadata(value["metadata"])
                 checkpoint: Checkpoint = {
-                    **value["checkpoint"],
+                    **raw_checkpoint,
                     "channel_values": self._load_blobs(value["channel_values"]),
                     "pending_sends": [
                         self.serde.loads_typed((t.decode(), v))
@@ -714,7 +839,7 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
                         }
                     },
                     checkpoint=checkpoint,
-                    metadata=value["metadata"],
+                    metadata=raw_metadata,
                     pending_writes=await asyncio.to_thread(
                         self._load_writes, value["pending_writes"]
                     ),
@@ -755,6 +880,23 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
             }
         }
 
+        input_hash = _hash_value(configurable)
+        output_hash = _hash_value(checkpoint.get("id", ""))
+        correlation_id = _get_correlation_id(config)
+        event_time = datetime.now(tz=timezone.utc)
+
+        logger.info(
+            "checkpoint.aput operation=aput thread_id=%s checkpoint_ns=%s checkpoint_id=%s "
+            "input_hash=%s output_hash=%s correlation_id=%s event_time=%s",
+            thread_id,
+            checkpoint_ns,
+            checkpoint.get("id", ""),
+            input_hash,
+            output_hash,
+            correlation_id,
+            event_time.isoformat(),
+        )
+
         async with self._cursor(pipeline=True) as cur:
             await cur.execute(
                 """DELETE FROM checkpoint_writes
@@ -785,6 +927,19 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
                     Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
                 ),
             )
+            await cur.execute(
+                INSERT_AUDIT_LOG_SQL,
+                (
+                    event_time,
+                    "aput",
+                    thread_id,
+                    checkpoint_ns,
+                    checkpoint.get("id", ""),
+                    input_hash,
+                    output_hash,
+                    correlation_id,
+                ),
+            )
         return next_config
 
     async def aput_writes(
@@ -808,17 +963,47 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
             if all(w[0] in WRITES_IDX_MAP for w in writes)
             else self.INSERT_CHECKPOINT_WRITES_SQL
         )
+        thread_id = config["configurable"]["thread_id"]
+        checkpoint_ns = config["configurable"]["checkpoint_ns"]
+        checkpoint_id = config["configurable"]["checkpoint_id"]
+        correlation_id = _get_correlation_id(config)
+        event_time = datetime.now(tz=timezone.utc)
+
+        logger.info(
+            "checkpoint.aput_writes operation=aput_writes thread_id=%s checkpoint_ns=%s "
+            "checkpoint_id=%s task_id=%s correlation_id=%s event_time=%s",
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id,
+            task_id,
+            correlation_id,
+            event_time.isoformat(),
+        )
+
         params = await asyncio.to_thread(
             self._dump_writes,
-            config["configurable"]["thread_id"],
-            config["configurable"]["checkpoint_ns"],
-            config["configurable"]["checkpoint_id"],
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id,
             task_id,
             task_path,
             writes,
         )
         async with self._cursor(pipeline=True) as cur:
             await cur.executemany(query, params)
+            await cur.execute(
+                INSERT_AUDIT_LOG_SQL,
+                (
+                    event_time,
+                    "aput_writes",
+                    thread_id,
+                    checkpoint_ns,
+                    checkpoint_id,
+                    _hash_value(task_id),
+                    _hash_value(len(writes)),
+                    correlation_id,
+                ),
+            )
 
     @asynccontextmanager
     async def _cursor(

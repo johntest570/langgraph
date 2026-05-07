@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import json
+import logging
+import uuid
 from collections.abc import Mapping
 from typing import Any, Literal, cast, overload
 
@@ -23,6 +28,31 @@ from langgraph_sdk.schema import (
     SortOrder,
     Subgraphs,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _audit_log(action: str, details: dict[str, Any]) -> None:
+    """Write an audit log entry for AI-driven actions."""
+    entry = {
+        "audit_id": str(uuid.uuid4()),
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "action": action,
+        "details": details,
+    }
+    try:
+        logger.info("AUDIT: %s", json.dumps(entry))
+    except Exception:
+        pass
+
+
+def _hash_payload(payload: Any) -> str:
+    try:
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode()
+        ).hexdigest()
+    except Exception:
+        return ""
 
 
 class SyncAssistantsClient:
@@ -82,9 +112,24 @@ class SyncAssistantsClient:
             ```
 
         """
-        return self.http.get(
+        _audit_log(
+            "assistants.get",
+            {
+                "assistant_id": assistant_id,
+                "input_hash": _hash_payload({"assistant_id": assistant_id}),
+            },
+        )
+        result = self.http.get(
             f"/assistants/{assistant_id}", headers=headers, params=params
         )
+        _audit_log(
+            "assistants.get.response",
+            {
+                "assistant_id": assistant_id,
+                "output_hash": _hash_payload(result),
+            },
+        )
+        return result
 
     def get_graph(
         self,
@@ -132,12 +177,28 @@ class SyncAssistantsClient:
             ```
 
         """
+        _audit_log(
+            "assistants.get_graph",
+            {
+                "assistant_id": assistant_id,
+                "xray": xray,
+                "input_hash": _hash_payload({"assistant_id": assistant_id, "xray": xray}),
+            },
+        )
         query_params = {"xray": xray}
         if params:
             query_params.update(params)
-        return self.http.get(
+        result = self.http.get(
             f"/assistants/{assistant_id}/graph", params=query_params, headers=headers
         )
+        _audit_log(
+            "assistants.get_graph.response",
+            {
+                "assistant_id": assistant_id,
+                "output_hash": _hash_payload(result),
+            },
+        )
+        return result
 
     def get_schemas(
         self,
@@ -268,9 +329,24 @@ class SyncAssistantsClient:
             ```
 
         """
-        return self.http.get(
+        _audit_log(
+            "assistants.get_schemas",
+            {
+                "assistant_id": assistant_id,
+                "input_hash": _hash_payload({"assistant_id": assistant_id}),
+            },
+        )
+        result = self.http.get(
             f"/assistants/{assistant_id}/schemas", headers=headers, params=params
         )
+        _audit_log(
+            "assistants.get_schemas.response",
+            {
+                "assistant_id": assistant_id,
+                "output_hash": _hash_payload(result),
+            },
+        )
+        return result
 
     def get_subgraphs(
         self,
@@ -292,6 +368,17 @@ class SyncAssistantsClient:
             Subgraphs: The graph schema for the assistant.
 
         """
+        _audit_log(
+            "assistants.get_subgraphs",
+            {
+                "assistant_id": assistant_id,
+                "namespace": namespace,
+                "recurse": recurse,
+                "input_hash": _hash_payload(
+                    {"assistant_id": assistant_id, "namespace": namespace, "recurse": recurse}
+                ),
+            },
+        )
         get_params = {"recurse": recurse}
         if params:
             get_params = {**get_params, **dict(params)}
@@ -375,9 +462,27 @@ class SyncAssistantsClient:
             payload["name"] = name
         if description:
             payload["description"] = description
-        return self.http.post(
+        _audit_log(
+            "assistants.create",
+            {
+                "graph_id": graph_id,
+                "assistant_id": assistant_id,
+                "name": name,
+                "input_hash": _hash_payload(payload),
+            },
+        )
+        result = self.http.post(
             "/assistants", json=payload, headers=headers, params=params
         )
+        _audit_log(
+            "assistants.create.response",
+            {
+                "graph_id": graph_id,
+                "assistant_id": assistant_id,
+                "output_hash": _hash_payload(result),
+            },
+        )
+        return result
 
     def update(
         self,
@@ -437,12 +542,29 @@ class SyncAssistantsClient:
             payload["name"] = name
         if description:
             payload["description"] = description
-        return self.http.patch(
+        _audit_log(
+            "assistants.update",
+            {
+                "assistant_id": assistant_id,
+                "graph_id": graph_id,
+                "name": name,
+                "input_hash": _hash_payload(payload),
+            },
+        )
+        result = self.http.patch(
             f"/assistants/{assistant_id}",
             json=payload,
             headers=headers,
             params=params,
         )
+        _audit_log(
+            "assistants.update.response",
+            {
+                "assistant_id": assistant_id,
+                "output_hash": _hash_payload(result),
+            },
+        )
+        return result
 
     def delete(
         self,
@@ -451,6 +573,7 @@ class SyncAssistantsClient:
         delete_threads: bool = False,
         headers: Mapping[str, str] | None = None,
         params: QueryParamTypes | None = None,
+        confirm: bool = False,
     ) -> None:
         """Delete an assistant.
 
@@ -461,6 +584,8 @@ class SyncAssistantsClient:
                 those threads.
             headers: Optional custom headers to include with the request.
             params: Optional query parameters to include with the request.
+            confirm: Human-in-the-Loop approval flag. Must be set to True to confirm
+                the delete operation. If False, the deletion will be aborted.
 
         Returns:
             `None`
@@ -470,11 +595,35 @@ class SyncAssistantsClient:
             ```python
             client = get_sync_client(url="http://localhost:2024")
             client.assistants.delete(
-                assistant_id="my_assistant_id"
+                assistant_id="my_assistant_id",
+                confirm=True
             )
             ```
 
         """
+        _audit_log(
+            "assistants.delete.requested",
+            {
+                "assistant_id": assistant_id,
+                "delete_threads": delete_threads,
+                "confirm": confirm,
+                "input_hash": _hash_payload(
+                    {"assistant_id": assistant_id, "delete_threads": delete_threads}
+                ),
+            },
+        )
+        if not confirm:
+            _audit_log(
+                "assistants.delete.aborted",
+                {
+                    "assistant_id": assistant_id,
+                    "reason": "HITL approval not provided; set confirm=True to proceed",
+                },
+            )
+            raise ValueError(
+                f"Deletion of assistant '{assistant_id}' requires explicit human approval. "
+                "Pass confirm=True to confirm this destructive operation."
+            )
         query_params: dict[str, Any] = {}
         if delete_threads:
             query_params["delete_threads"] = True
@@ -484,6 +633,13 @@ class SyncAssistantsClient:
             f"/assistants/{assistant_id}",
             headers=headers,
             params=query_params or None,
+        )
+        _audit_log(
+            "assistants.delete.completed",
+            {
+                "assistant_id": assistant_id,
+                "delete_threads": delete_threads,
+            },
         )
 
     @overload
@@ -592,6 +748,17 @@ class SyncAssistantsClient:
             payload["sort_order"] = sort_order
         if select:
             payload["select"] = select
+        _audit_log(
+            "assistants.search",
+            {
+                "graph_id": graph_id,
+                "name": name,
+                "limit": limit,
+                "offset": offset,
+                "response_format": response_format,
+                "input_hash": _hash_payload(payload),
+            },
+        )
         next_cursor: str | None = None
 
         def capture_pagination(response: httpx.Response) -> None:
@@ -607,6 +774,14 @@ class SyncAssistantsClient:
                 params=params,
                 on_response=capture_pagination if response_format == "object" else None,
             ),
+        )
+        _audit_log(
+            "assistants.search.response",
+            {
+                "graph_id": graph_id,
+                "result_count": len(assistants) if isinstance(assistants, list) else None,
+                "output_hash": _hash_payload(assistants),
+            },
         )
         if response_format == "object":
             return {"assistants": assistants, "next": next_cursor}
@@ -641,9 +816,25 @@ class SyncAssistantsClient:
             payload["graph_id"] = graph_id
         if name:
             payload["name"] = name
-        return self.http.post(
+        _audit_log(
+            "assistants.count",
+            {
+                "graph_id": graph_id,
+                "name": name,
+                "input_hash": _hash_payload(payload),
+            },
+        )
+        result = self.http.post(
             "/assistants/count", json=payload, headers=headers, params=params
         )
+        _audit_log(
+            "assistants.count.response",
+            {
+                "graph_id": graph_id,
+                "result": result,
+            },
+        )
+        return result
 
     def get_versions(
         self,
@@ -684,12 +875,29 @@ class SyncAssistantsClient:
         }
         if metadata:
             payload["metadata"] = metadata
-        return self.http.post(
+        _audit_log(
+            "assistants.get_versions",
+            {
+                "assistant_id": assistant_id,
+                "limit": limit,
+                "offset": offset,
+                "input_hash": _hash_payload(payload),
+            },
+        )
+        result = self.http.post(
             f"/assistants/{assistant_id}/versions",
             json=payload,
             headers=headers,
             params=params,
         )
+        _audit_log(
+            "assistants.get_versions.response",
+            {
+                "assistant_id": assistant_id,
+                "output_hash": _hash_payload(result),
+            },
+        )
+        return result
 
     def set_latest(
         self,
@@ -722,10 +930,26 @@ class SyncAssistantsClient:
         """
 
         payload: dict[str, Any] = {"version": version}
-
-        return self.http.post(
+        _audit_log(
+            "assistants.set_latest",
+            {
+                "assistant_id": assistant_id,
+                "version": version,
+                "input_hash": _hash_payload(payload),
+            },
+        )
+        result = self.http.post(
             f"/assistants/{assistant_id}/latest",
             json=payload,
             headers=headers,
             params=params,
         )
+        _audit_log(
+            "assistants.set_latest.response",
+            {
+                "assistant_id": assistant_id,
+                "version": version,
+                "output_hash": _hash_payload(result),
+            },
+        )
+        return result

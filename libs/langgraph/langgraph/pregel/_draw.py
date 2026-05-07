@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any, NamedTuple, cast
@@ -25,6 +29,8 @@ from langgraph.pregel._read import PregelNode
 from langgraph.pregel._write import ChannelWrite
 from langgraph.types import All, Checkpointer
 
+_audit_logger = logging.getLogger("langgraph.audit")
+
 
 class Edge(NamedTuple):
     source: str
@@ -37,6 +43,23 @@ class TriggerEdge(NamedTuple):
     source: str
     conditional: bool
     data: str | None
+
+
+def _hash_input(data: Any) -> str:
+    try:
+        serialized = json.dumps(data, sort_keys=True, default=str)
+    except Exception:
+        serialized = str(data)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _log_audit_event(event: str, **kwargs: Any) -> None:
+    record = {
+        "event": event,
+        "timestamp": time.time(),
+        **kwargs,
+    }
+    _audit_logger.info(json.dumps(record, default=str))
 
 
 def draw_graph(
@@ -96,6 +119,19 @@ def draw_graph(
         get_next_version,
         trigger_to_nodes,
     )
+
+    _principal = config.get("configurable", {}).get("user_id", "unknown") if config else "unknown"
+    _input_hash = _hash_input(input_writes)
+    _log_audit_event(
+        "draw_graph.prepare_next_tasks",
+        step=step,
+        phase="initial",
+        input_hash=_input_hash,
+        node_names=list(nodes.keys()),
+        principal=_principal,
+        updated_channels=list(updated_channels) if updated_channels else [],
+    )
+
     # prepare first tasks
     tasks = prepare_next_tasks(
         checkpoint,
@@ -113,6 +149,17 @@ def draw_graph(
         trigger_to_nodes=trigger_to_nodes,
         updated_channels=updated_channels,
     )
+
+    _log_audit_event(
+        "draw_graph.prepare_next_tasks.result",
+        step=step,
+        phase="initial",
+        input_hash=_input_hash,
+        task_names=list(tasks.keys()) if tasks else [],
+        task_count=len(tasks) if tasks else 0,
+        principal=_principal,
+    )
+
     start_tasks = tasks
     # run the pregel loop
     for step in range(step, limit):
@@ -172,6 +219,22 @@ def draw_graph(
         updated_channels = apply_writes(
             checkpoint, channels, tasks.values(), get_next_version, trigger_to_nodes
         )
+
+        _loop_input_hash = _hash_input({
+            "step": step,
+            "task_names": list(tasks.keys()),
+            "updated_channels": list(updated_channels) if updated_channels else [],
+        })
+        _log_audit_event(
+            "draw_graph.prepare_next_tasks",
+            step=step,
+            phase="loop",
+            input_hash=_loop_input_hash,
+            task_names=list(tasks.keys()) if tasks else [],
+            updated_channels=list(updated_channels) if updated_channels else [],
+            principal=_principal,
+        )
+
         # prepare next tasks
         tasks = prepare_next_tasks(
             checkpoint,
@@ -189,6 +252,17 @@ def draw_graph(
             trigger_to_nodes=trigger_to_nodes,
             updated_channels=updated_channels,
         )
+
+        _log_audit_event(
+            "draw_graph.prepare_next_tasks.result",
+            step=step,
+            phase="loop",
+            input_hash=_loop_input_hash,
+            task_names=list(tasks.keys()) if tasks else [],
+            task_count=len(tasks) if tasks else 0,
+            principal=_principal,
+        )
+
         # collect deferred nodes
         deferred_nodes: set[str] = set()
         edges_to_deferred_nodes: set[Edge] = set()

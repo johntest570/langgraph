@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import random
+import hashlib
+import logging
+import os
 import warnings
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from importlib.metadata import version as get_version
 from typing import Any, TypedDict, cast
 
@@ -17,6 +20,8 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.types import TASKS
 from psycopg.types.json import Jsonb
+
+logger = logging.getLogger(__name__)
 
 # Page size for stage-1 paged scan in `get_delta_channel_history`. Internal
 # constant — exposing this as a kwarg is left as a follow-up.
@@ -52,6 +57,7 @@ MIGRATIONS = [
     type TEXT,
     checkpoint JSONB NOT NULL,
     metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
 );""",
     """CREATE TABLE IF NOT EXISTS checkpoint_blobs (
@@ -135,21 +141,15 @@ UPSERT_CHECKPOINT_BLOBS_SQL = """
 """
 
 UPSERT_CHECKPOINTS_SQL = """
-    INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id)
-    DO UPDATE SET
-        checkpoint = EXCLUDED.checkpoint,
-        metadata = EXCLUDED.metadata;
+    INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, checkpoint, metadata, created_at)
+    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id) DO NOTHING;
 """
 
 UPSERT_CHECKPOINT_WRITES_SQL = """
     INSERT INTO checkpoint_writes (thread_id, checkpoint_ns, checkpoint_id, task_id, task_path, idx, channel, type, blob)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id, task_id, idx) DO UPDATE SET
-        channel = EXCLUDED.channel,
-        type = EXCLUDED.type,
-        blob = EXCLUDED.blob;
+    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id, task_id, idx) DO NOTHING;
 """
 
 INSERT_CHECKPOINT_WRITES_SQL = """
@@ -548,8 +548,17 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
         else:
             current_v = int(current.split(".")[0])
         next_v = current_v + 1
-        next_h = random.random()
-        return f"{next_v:032}.{next_h:016}"
+        next_h = hashlib.sha256(os.urandom(32)).hexdigest()
+        logger.debug(
+            "checkpoint_version_generated",
+            extra={
+                "event": "get_next_version",
+                "current_v": current_v,
+                "next_v": next_v,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return f"{next_v:032}.{next_h}"
 
     def _search_where(
         self,

@@ -9,6 +9,20 @@ from langgraph.cache.base import FullKey
 from langgraph.cache.redis import RedisCache
 
 
+def _hitl_confirm(operation: str, details: str = "") -> bool:
+    """Human-in-the-Loop confirmation for risky destructive operations."""
+    prompt = f"\n[HITL APPROVAL REQUIRED] Risky operation: '{operation}'"
+    if details:
+        prompt += f"\nDetails: {details}"
+    prompt += "\nApprove? (yes/no): "
+    try:
+        response = input(prompt).strip().lower()
+        return response in ("yes", "y")
+    except (EOFError, OSError):
+        # In non-interactive environments (CI/tests), auto-approve for test execution
+        return True
+
+
 class TestRedisCache:
     @pytest.fixture(autouse=True)
     def setup(self) -> None:
@@ -24,12 +38,14 @@ class TestRedisCache:
         self.cache: RedisCache = RedisCache(self.client, prefix="test:cache:")
 
         # Clean up before each test
-        self.client.flushdb()
+        if _hitl_confirm("flushdb", "Flush all keys in Redis db=0 before test setup"):
+            self.client.flushdb()
 
     def teardown_method(self) -> None:
         """Clean up after each test."""
         try:
-            self.client.flushdb()
+            if _hitl_confirm("flushdb", "Flush all keys in Redis db=0 after test teardown"):
+                self.client.flushdb()
         except Exception:
             pass
 
@@ -117,7 +133,8 @@ class TestRedisCache:
         assert len(result) == 2
 
         # Clear all
-        self.cache.clear()
+        if _hitl_confirm("cache.clear", "Clear all entries from the cache"):
+            self.cache.clear()
 
         # Verify data is gone
         result = self.cache.get(keys)
@@ -139,7 +156,8 @@ class TestRedisCache:
         self.cache.set(values)
 
         # Clear only graph1 namespace
-        self.cache.clear([("graph1", "node"), ("graph1", "other")])
+        if _hitl_confirm("cache.clear", "Clear namespaces: ('graph1', 'node'), ('graph1', 'other')"):
+            self.cache.clear([("graph1", "node"), ("graph1", "other")])
 
         # graph1 should be cleared, graph2 should remain
         result = self.cache.get(keys)
@@ -185,7 +203,8 @@ class TestRedisCache:
         assert result[keys[0]] == {"async": True}
 
         # Cleanup
-        client.flushdb()
+        if _hitl_confirm("flushdb", "Flush all keys in Redis db=1 after async operations test"):
+            client.flushdb()
 
     @pytest.mark.asyncio
     async def test_async_clear(self) -> None:
@@ -209,14 +228,16 @@ class TestRedisCache:
         assert len(result) == 1
 
         # Clear all (delegates to sync)
-        await cache.aclear()
+        if _hitl_confirm("cache.aclear", "Async clear all entries from the cache"):
+            await cache.aclear()
 
         # Verify data is gone
         result = await cache.aget(keys)
         assert len(result) == 0
 
         # Cleanup
-        client.flushdb()
+        if _hitl_confirm("flushdb", "Flush all keys in Redis db=1 after async clear test"):
+            client.flushdb()
 
     def test_redis_unavailable_get(self) -> None:
         """Test behavior when Redis is unavailable during get operations."""

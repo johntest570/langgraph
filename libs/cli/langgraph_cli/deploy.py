@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import click
 import click.exceptions
@@ -95,6 +96,22 @@ _TERMINAL_STATUSES = frozenset(
     ]
 )
 
+# Allowlist of trusted registry hostname suffixes for Docker image push.
+_ALLOWED_REGISTRY_SUFFIXES = (
+    ".gcr.io",
+    ".pkg.dev",
+    ".amazonaws.com",
+    ".azurecr.io",
+    "gcr.io",
+    "registry.hub.docker.com",
+)
+
+# Allowlist of trusted GCS hostname suffixes for signed URL uploads.
+_ALLOWED_GCS_HOSTS = (
+    "storage.googleapis.com",
+    ".storage.googleapis.com",
+)
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -143,6 +160,44 @@ def validate_deploy_commands(
     ):
         raise click.UsageError(
             "build_command contains disallowed characters or patterns."
+        )
+
+
+def _validate_registry_url(registry_url: str) -> None:
+    """Validate that a registry URL hostname is in the trusted allowlist."""
+    normalized = registry_url.rstrip("/")
+    if "://" in normalized:
+        hostname = urlparse(normalized).hostname or ""
+    else:
+        hostname = normalized.split("/")[0]
+    if not any(
+        hostname == allowed.lstrip(".") or hostname.endswith(allowed)
+        for allowed in _ALLOWED_REGISTRY_SUFFIXES
+    ):
+        raise click.ClickException(
+            f"Registry URL hostname '{hostname}' is not in the trusted allowlist. "
+            "Refusing to push image to an untrusted registry."
+        )
+
+
+def _validate_gcs_signed_url(signed_url: str) -> None:
+    """Validate that a GCS signed URL hostname is in the trusted allowlist."""
+    try:
+        parsed = urlparse(signed_url)
+    except Exception:
+        raise click.ClickException("Invalid upload URL received from server.") from None
+    if parsed.scheme not in ("https",):
+        raise click.ClickException(
+            f"Upload URL scheme '{parsed.scheme}' is not allowed. Only HTTPS is permitted."
+        )
+    hostname = parsed.hostname or ""
+    if not any(
+        hostname == allowed.lstrip(".") or hostname.endswith(allowed)
+        for allowed in _ALLOWED_GCS_HOSTS
+    ):
+        raise click.ClickException(
+            f"Upload URL hostname '{hostname}' is not in the trusted allowlist. "
+            "Refusing to upload to an untrusted destination."
         )
 
 
@@ -450,8 +505,6 @@ def _create_deployment(
 
 def _smith_dashboard_base_url(host_url: str | None) -> str:
     """Derive the LangSmith dashboard base URL from the API host URL."""
-    from urllib.parse import urlparse
-
     if not host_url:
         return "https://smith.langchain.com"
     parsed = urlparse(host_url)
@@ -584,9 +637,18 @@ def _docker_config_for_token(registry_host: str, token: str):
     auth_b64 = base64.b64encode(f"oauth2accesstoken:{token}".encode()).decode()
     config_data = {"auths": {registry_host: {"auth": auth_b64}}}
     with tempfile.TemporaryDirectory() as tmpdir:
-        with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        config_path = os.path.join(tmpdir, "config.json")
+        with open(config_path, "w") as f:
             json_mod.dump(config_data, f)
-        yield tmpdir
+        try:
+            yield tmpdir
+        finally:
+            # Explicitly zero out the config file before the temp dir is removed
+            try:
+                with open(config_path, "w") as f:
+                    f.write("{}")
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +688,9 @@ def _upload_to_gcs(signed_url: str, file_path: str, file_size: int) -> None:
     import urllib.error
     import urllib.request
 
+    # Validate the signed URL against the trusted GCS allowlist before uploading.
+    _validate_gcs_signed_url(signed_url)
+
     with open(file_path, "rb") as f:
         req = urllib.request.Request(
             signed_url,
@@ -640,9 +705,8 @@ def _upload_to_gcs(signed_url: str, file_path: str, file_size: int) -> None:
         try:
             urllib.request.urlopen(req, timeout=_UPLOAD_TIMEOUT_SECONDS)
         except urllib.error.HTTPError as err:
-            detail = err.read().decode("utf-8", errors="ignore")
             raise click.ClickException(
-                f"Upload failed with status {err.code}: {detail}"
+                f"Upload failed with HTTP status {err.code}."
             ) from None
     click.echo()
 
@@ -744,8 +808,12 @@ def _run_local_build(
         registry_url = push_data.get("registry_url")
         if not deployment_token or not registry_url:
             raise click.ClickException(
-                "Push token response missing token or registry_url"
+                "Push token response missing required fields"
             )
+
+        # Validate the registry URL against the trusted allowlist before use.
+        _validate_registry_url(registry_url)
+
         step += 1
 
         normalized_registry = registry_url.rstrip("/")
@@ -1628,77 +1696,3 @@ def deploy_logs(
                 "No revisions found for this deployment. Cannot fetch build logs."
             )
         revision_id = str(resources[0]["id"])
-        click.secho(f"Using latest revision: {revision_id}", fg="cyan")
-
-    payload: dict = {"limit": limit, "order": "desc"}
-    if level:
-        payload["level"] = level.upper()
-    if query:
-        payload["query"] = query
-    if start_time:
-        payload["start_time"] = start_time
-    if end_time:
-        payload["end_time"] = end_time
-
-    def _fetch(request_payload: dict) -> list[dict]:
-        if log_type == "build":
-            resp = client.get_build_logs(dep_id, revision_id, request_payload)
-        else:
-            resp = client.get_deploy_logs(dep_id, request_payload, revision_id)
-
-        if isinstance(resp, dict):
-            return resp.get("logs", [])
-        return []
-
-    def _print_entries(entries: list[dict], *, reverse: bool = False) -> None:
-        iterable = reversed(entries) if reverse else entries
-        for entry in iterable:
-            line = format_log_entry(entry)
-            fg = level_fg(entry.get("level", ""))
-            click.secho(line, fg=fg)
-
-    def _fetch_and_print(request_payload: dict, *, reverse: bool = False) -> list[dict]:
-        entries = _fetch(request_payload)
-        _print_entries(entries, reverse=reverse)
-        return entries
-
-    def _fetch_and_print_new(request_payload: dict, seen_ids: set[str]) -> list[dict]:
-        entries = _fetch(request_payload)
-        new = [e for e in entries if e.get("id", "") not in seen_ids]
-        if new:
-            _print_entries(new)
-            seen_ids.update(e.get("id", "") for e in new)
-        return new
-
-    # initial log fetch will be newest -> oldest, so we need to reverse
-    entries = _fetch_and_print(payload, reverse=True)
-
-    if not follow:
-        if not entries:
-            click.secho("No log entries found.", fg="yellow")
-        return
-
-    payload["order"] = "asc"
-    seen_ids: set[str] = {e.get("id", "") for e in entries if e.get("id")}
-
-    def _update_start_time(ts) -> None:
-        if ts is None:
-            return
-        if isinstance(ts, (int, float)):
-            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-            payload["start_time"] = dt.isoformat()
-        else:
-            payload["start_time"] = str(ts)
-
-    if entries:
-        # entries are in descending order here, so index 0 is the newest log
-        _update_start_time(entries[0].get("timestamp"))
-
-    try:
-        while True:
-            time.sleep(2)
-            new_entries = _fetch_and_print_new(payload, seen_ids)
-            if new_entries:
-                _update_start_time(new_entries[-1].get("timestamp"))
-    except KeyboardInterrupt:
-        click.echo("\nStopped.")

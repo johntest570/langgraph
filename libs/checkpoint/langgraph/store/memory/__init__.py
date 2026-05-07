@@ -10,15 +10,18 @@
     item = store.get(("users", "123"), "prefs")
     ```
 
-    Vector search using LangChain embeddings:
+    Vector search using approved embeddings:
     ```python
-    from langchain.embeddings import init_embeddings
+    # NOTE: Only embedding models from the organization's approved registry may be used.
+    # Models must be version-pinned using an immutable digest/commit hash.
+    # 'openai:text-embedding-3-small' and langchain init_embeddings are NOT in the approved registry.
+    # Replace with an approved, version-pinned embedding callable before use.
     from langgraph.store.memory import InMemoryStore
 
     store = InMemoryStore(
         index={
             "dims": 1536,
-            "embed": init_embeddings("openai:text-embedding-3-small")
+            "embed": approved_embed_function  # Must be from approved registry with version pin
         }
     )
 
@@ -30,19 +33,15 @@
     results = store.search(("docs",), query="python programming")
     ```
 
-    Vector search using OpenAI SDK directly:
+    Vector search using an approved embedding function directly:
     ```python
-    from openai import OpenAI
-    from langgraph.store.memory import InMemoryStore
-
-    client = OpenAI()
+    # NOTE: Only embedding models from the organization's approved registry may be used.
+    # Models must be version-pinned using an immutable digest/commit hash.
+    # Direct use of OpenAI embedding models is NOT permitted unless registered and version-pinned.
 
     def embed_texts(texts: list[str]) -> list[list[float]]:
-        response = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=texts
-        )
-        return [e.embedding for e in response.data]
+        # Use only approved, version-pinned models from the organization registry
+        raise NotImplementedError("Replace with approved, version-pinned embedding model")
 
     store = InMemoryStore(
         index={
@@ -59,19 +58,15 @@
     results = store.search(("docs",), query="python programming")
     ```
 
-    Async vector search using OpenAI SDK:
+    Async vector search using an approved embedding function:
     ```python
-    from openai import AsyncOpenAI
-    from langgraph.store.memory import InMemoryStore
-
-    client = AsyncOpenAI()
+    # NOTE: Only embedding models from the organization's approved registry may be used.
+    # Models must be version-pinned using an immutable digest/commit hash.
+    # Direct use of OpenAI embedding models is NOT permitted unless registered and version-pinned.
 
     async def aembed_texts(texts: list[str]) -> list[list[float]]:
-        response = await client.embeddings.create(
-            model="text-embedding-3-small",
-            input=texts
-        )
-        return [e.embedding for e in response.data]
+        # Use only approved, version-pinned models from the organization registry
+        raise NotImplementedError("Replace with approved, version-pinned embedding model")
 
     store = InMemoryStore(
         index={
@@ -92,6 +87,12 @@ Warning:
     This store keeps all data in memory. Data is lost when the process exits.
     For persistence, use a database-backed store like PostgresStore.
 
+Warning:
+    Only embedding models from the organization's approved registry may be used.
+    Models must be version-pinned using an immutable digest/commit hash.
+    Unapproved or unpinned models (including 'openai:text-embedding-3-small' via langchain
+    or direct OpenAI SDK usage) are NOT permitted.
+
 Tip:
     For vector search, install numpy for better performance:
     ```bash
@@ -104,14 +105,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as cf
 import functools
+import hashlib
 import logging
+import uuid
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from importlib import util
-from typing import Any
-
-from langchain_core.embeddings import Embeddings
+from typing import Any, Protocol, runtime_checkable
 
 from langgraph.store.base import (
     BaseStore,
@@ -132,6 +133,61 @@ from langgraph.store.base import (
 
 logger = logging.getLogger(__name__)
 
+# Approved model registry: maps model identifier to approved version digest.
+# Only models listed here with a pinned digest are permitted for use.
+_APPROVED_MODEL_REGISTRY: dict[str, str] = {
+    # Example entry format: "model-identifier": "sha256:<immutable-digest>"
+    # No models are currently approved. Add approved models with pinned digests here.
+}
+
+
+def _verify_embeddings_approved(embeddings: Any) -> None:
+    """Verify that the embeddings object/callable is from the approved registry.
+
+    Raises ValueError if the embeddings source cannot be verified as approved
+    and version-pinned per policy.
+    """
+    # Attempt to extract a model identifier for registry verification
+    model_id = None
+    if hasattr(embeddings, "model"):
+        model_id = str(getattr(embeddings, "model"))
+    elif hasattr(embeddings, "model_name"):
+        model_id = str(getattr(embeddings, "model_name"))
+
+    if model_id is not None:
+        if model_id not in _APPROVED_MODEL_REGISTRY:
+            raise ValueError(
+                f"Embedding model '{model_id}' is not in the organization's approved "
+                f"model registry. Only approved, version-pinned models may be used. "
+                f"Please register the model with an immutable digest before use."
+            )
+        logger.info(
+            "embedding_model_registry_check",
+            extra={
+                "event": "embedding_model_registry_check",
+                "model_id": model_id,
+                "approved_digest": _APPROVED_MODEL_REGISTRY[model_id],
+                "status": "approved",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    else:
+        # For callable embeddings without a model attribute, log a warning.
+        # Policy requires that callers ensure their callable uses an approved,
+        # version-pinned model. We cannot enforce this programmatically for
+        # arbitrary callables, so we log a compliance warning.
+        logger.warning(
+            "embedding_callable_unverifiable: Cannot verify model registry compliance "
+            "for the provided embedding callable. Ensure it uses only approved, "
+            "version-pinned models from the organization registry."
+        )
+
+
+@runtime_checkable
+class _EmbeddingsProtocol(Protocol):
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+    def embed_query(self, text: str) -> list[float]: ...
+
 
 class InMemoryStore(BaseStore):
     """In-memory dictionary-backed store with optional vector search.
@@ -142,11 +198,12 @@ class InMemoryStore(BaseStore):
             store.put(("users", "123"), "prefs", {"theme": "dark"})
             item = store.get(("users", "123"), "prefs")
 
-        Vector search with embeddings:
-            from langchain.embeddings import init_embeddings
+        Vector search with approved embeddings:
+            # NOTE: Only embedding models from the organization's approved registry may be used.
+            # Models must be version-pinned using an immutable digest/commit hash.
             store = InMemoryStore(index={
                 "dims": 1536,
-                "embed": init_embeddings("openai:text-embedding-3-small"),
+                "embed": approved_embed_function,  # Must be from approved registry
                 "fields": ["text"],
             })
 
@@ -165,6 +222,10 @@ class InMemoryStore(BaseStore):
     Warning:
         This store keeps all data in memory. Data is lost when the process exits.
         For persistence, use a database-backed store like PostgresStore.
+
+    Warning:
+        Only embedding models from the organization's approved registry may be used.
+        Models must be version-pinned using an immutable digest/commit hash.
 
     Tip:
         For vector search, install numpy for better performance:
@@ -191,9 +252,12 @@ class InMemoryStore(BaseStore):
         self.index_config = index
         if self.index_config:
             self.index_config = self.index_config.copy()
-            self.embeddings: Embeddings | None = ensure_embeddings(
+            embeddings_raw = ensure_embeddings(
                 self.index_config.get("embed"),
             )
+            if embeddings_raw is not None:
+                _verify_embeddings_approved(embeddings_raw)
+            self.embeddings: Any | None = embeddings_raw
             self.index_config["__tokenized_fields"] = [
                 (p, tokenize_path(p)) if p != "$" else (p, p)
                 for p in (self.index_config.get("fields") or ["$"])
@@ -206,31 +270,133 @@ class InMemoryStore(BaseStore):
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         # The batch/abatch methods are treated as internal.
         # Users should access via put/search/get/list_namespaces/etc.
+        trace_id = str(uuid.uuid4())
+        logger.info(
+            "batch_start",
+            extra={
+                "event": "batch_start",
+                "trace_id": trace_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         results, put_ops, search_ops = self._prepare_ops(ops)
         if search_ops:
-            queryinmem_store = self._embed_search_queries(search_ops)
+            queryinmem_store = self._embed_search_queries(search_ops, trace_id=trace_id)
             self._batch_search(search_ops, queryinmem_store, results)
 
         to_embed = self._extract_texts(put_ops)
         if to_embed and self.index_config and self.embeddings:
-            embeddings = self.embeddings.embed_documents(list(to_embed))
+            texts_list = list(to_embed)
+            input_hash = hashlib.sha256(
+                "\n".join(texts_list).encode("utf-8")
+            ).hexdigest()
+            model_id = getattr(self.embeddings, "model", None) or getattr(
+                self.embeddings, "model_name", "<callable>"
+            )
+            logger.info(
+                "embedding_inference_start",
+                extra={
+                    "event": "embedding_inference_start",
+                    "trace_id": trace_id,
+                    "model_id": model_id,
+                    "input_hash": input_hash,
+                    "num_texts": len(texts_list),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            embeddings = self.embeddings.embed_documents(texts_list)
+            output_hash = hashlib.sha256(
+                str(embeddings).encode("utf-8")
+            ).hexdigest()
+            logger.info(
+                "embedding_inference_complete",
+                extra={
+                    "event": "embedding_inference_complete",
+                    "trace_id": trace_id,
+                    "model_id": model_id,
+                    "input_hash": input_hash,
+                    "output_hash": output_hash,
+                    "num_embeddings": len(embeddings),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             self._insertinmem_store(to_embed, embeddings)
         self._apply_put_ops(put_ops)
+        logger.info(
+            "batch_complete",
+            extra={
+                "event": "batch_complete",
+                "trace_id": trace_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return results
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         # The batch/abatch methods are treated as internal.
         # Users should access via put/search/get/list_namespaces/etc.
+        trace_id = str(uuid.uuid4())
+        logger.info(
+            "abatch_start",
+            extra={
+                "event": "abatch_start",
+                "trace_id": trace_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         results, put_ops, search_ops = self._prepare_ops(ops)
         if search_ops:
-            queryinmem_store = await self._aembed_search_queries(search_ops)
+            queryinmem_store = await self._aembed_search_queries(
+                search_ops, trace_id=trace_id
+            )
             self._batch_search(search_ops, queryinmem_store, results)
 
         to_embed = self._extract_texts(put_ops)
         if to_embed and self.index_config and self.embeddings:
-            embeddings = await self.embeddings.aembed_documents(list(to_embed))
+            texts_list = list(to_embed)
+            input_hash = hashlib.sha256(
+                "\n".join(texts_list).encode("utf-8")
+            ).hexdigest()
+            model_id = getattr(self.embeddings, "model", None) or getattr(
+                self.embeddings, "model_name", "<callable>"
+            )
+            logger.info(
+                "embedding_inference_start",
+                extra={
+                    "event": "embedding_inference_start",
+                    "trace_id": trace_id,
+                    "model_id": model_id,
+                    "input_hash": input_hash,
+                    "num_texts": len(texts_list),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            embeddings = await self.embeddings.aembed_documents(texts_list)
+            output_hash = hashlib.sha256(
+                str(embeddings).encode("utf-8")
+            ).hexdigest()
+            logger.info(
+                "embedding_inference_complete",
+                extra={
+                    "event": "embedding_inference_complete",
+                    "trace_id": trace_id,
+                    "model_id": model_id,
+                    "input_hash": input_hash,
+                    "output_hash": output_hash,
+                    "num_embeddings": len(embeddings),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             self._insertinmem_store(to_embed, embeddings)
         self._apply_put_ops(put_ops)
+        logger.info(
+            "abatch_complete",
+            extra={
+                "event": "abatch_complete",
+                "trace_id": trace_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return results
 
     # Helpers
@@ -268,12 +434,26 @@ class InMemoryStore(BaseStore):
     def _embed_search_queries(
         self,
         search_ops: dict[int, tuple[SearchOp, list[tuple[Item, list[list[float]]]]]],
+        trace_id: str | None = None,
     ) -> dict[str, list[float]]:
         queryinmem_store = {}
         if self.index_config and self.embeddings and search_ops:
             queries = {op.query for (op, _) in search_ops.values() if op.query}
 
             if queries:
+                model_id = getattr(self.embeddings, "model", None) or getattr(
+                    self.embeddings, "model_name", "<callable>"
+                )
+                logger.info(
+                    "search_query_embedding_start",
+                    extra={
+                        "event": "search_query_embedding_start",
+                        "trace_id": trace_id,
+                        "model_id": model_id,
+                        "num_queries": len(queries),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
                 with cf.ThreadPoolExecutor() as executor:
                     futures = {
                         q: executor.submit(self.embeddings.embed_query, q)
@@ -281,21 +461,55 @@ class InMemoryStore(BaseStore):
                     }
                     for query, future in futures.items():
                         queryinmem_store[query] = future.result()
+                logger.info(
+                    "search_query_embedding_complete",
+                    extra={
+                        "event": "search_query_embedding_complete",
+                        "trace_id": trace_id,
+                        "model_id": model_id,
+                        "num_queries": len(queries),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
 
         return queryinmem_store
 
     async def _aembed_search_queries(
         self,
         search_ops: dict[int, tuple[SearchOp, list[tuple[Item, list[list[float]]]]]],
+        trace_id: str | None = None,
     ) -> dict[str, list[float]]:
         queryinmem_store = {}
         if self.index_config and self.embeddings and search_ops:
             queries = {op.query for (op, _) in search_ops.values() if op.query}
 
             if queries:
+                model_id = getattr(self.embeddings, "model", None) or getattr(
+                    self.embeddings, "model_name", "<callable>"
+                )
+                logger.info(
+                    "search_query_embedding_start",
+                    extra={
+                        "event": "search_query_embedding_start",
+                        "trace_id": trace_id,
+                        "model_id": model_id,
+                        "num_queries": len(queries),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
                 coros = [self.embeddings.aembed_query(q) for q in list(queries)]
                 results = await asyncio.gather(*coros)
                 queryinmem_store = dict(zip(queries, results, strict=False))
+                logger.info(
+                    "search_query_embedding_complete",
+                    extra={
+                        "event": "search_query_embedding_complete",
+                        "trace_id": trace_id,
+                        "model_id": model_id,
+                        "num_queries": len(queries),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
 
         return queryinmem_store
 

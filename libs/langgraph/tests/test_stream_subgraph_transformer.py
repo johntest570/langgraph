@@ -9,7 +9,9 @@ real-graph tests exercise the end-to-end navigation path through
 
 from __future__ import annotations
 
+import base64
 import operator
+import re
 import time
 from collections.abc import AsyncIterator
 from functools import partial
@@ -38,6 +40,94 @@ from langgraph.stream.transformers import (
 )
 
 TS = int(time.time() * 1000)
+
+# ---------------------------------------------------------------------------
+# Input validation helpers
+# ---------------------------------------------------------------------------
+
+_SHELL_COMMAND_PATTERN = re.compile(
+    r"(;|\||&&|\$\(|`|>|<|\\x[0-9a-fA-F]{2})", re.IGNORECASE
+)
+_SUSPICIOUS_KEYWORDS = re.compile(
+    r"\b(exec|eval|import|__import__|subprocess|os\.system|shell|cmd|powershell|bash|sh)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_base64_encoded(value: str) -> bool:
+    """Return True if the string appears to be base64-encoded content."""
+    if len(value) < 8:
+        return False
+    try:
+        decoded = base64.b64decode(value, validate=True)
+        # If it decodes to printable-looking bytes with suspicious content, flag it
+        decoded_str = decoded.decode("utf-8", errors="ignore")
+        if _SHELL_COMMAND_PATTERN.search(decoded_str) or _SUSPICIOUS_KEYWORDS.search(
+            decoded_str
+        ):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _sanitize_string_value(key: str, value: str) -> str:
+    """Validate a string value for suspicious content."""
+    if _SHELL_COMMAND_PATTERN.search(value):
+        raise ValueError(
+            f"Input field '{key}' contains potentially malicious shell content: {value!r}"
+        )
+    if _SUSPICIOUS_KEYWORDS.search(value):
+        raise ValueError(
+            f"Input field '{key}' contains suspicious keyword content: {value!r}"
+        )
+    if _is_base64_encoded(value):
+        raise ValueError(
+            f"Input field '{key}' appears to contain base64-encoded suspicious content."
+        )
+    return value
+
+
+def _sanitize_list_value(key: str, value: list) -> list:
+    """Validate each element of a list field."""
+    sanitized = []
+    for item in value:
+        if isinstance(item, str):
+            sanitized.append(_sanitize_string_value(key, item))
+        else:
+            sanitized.append(item)
+    return sanitized
+
+
+def _validate_graph_input(input_data: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize and validate input before passing to graph.stream_events.
+
+    Checks for:
+    - Shell commands / injection patterns
+    - Base64-encoded payloads with suspicious content
+    - Leetspeak / obfuscated commands (basic check via suspicious keywords)
+    - Binary or non-string unexpected types in string fields
+    """
+    if not isinstance(input_data, dict):
+        raise TypeError(f"Graph input must be a dict, got {type(input_data)!r}")
+
+    sanitized: dict[str, Any] = {}
+    for key, value in input_data.items():
+        if not isinstance(key, str):
+            raise TypeError(f"Input key must be a string, got {type(key)!r}")
+        if isinstance(value, str):
+            sanitized[key] = _sanitize_string_value(key, value)
+        elif isinstance(value, list):
+            sanitized[key] = _sanitize_list_value(key, value)
+        elif isinstance(value, (int, float, bool, type(None))):
+            sanitized[key] = value
+        elif isinstance(value, dict):
+            sanitized[key] = _validate_graph_input(value)
+        else:
+            raise TypeError(
+                f"Input field '{key}' has unsupported type {type(value)!r}"
+            )
+    return sanitized
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +854,8 @@ def _make_failing_nested() -> Any:
 def test_stream_events_v3_real_graph_yields_subgraph_handles() -> None:
     """Iterating `run.subgraphs` yields handles for direct-child subgraphs."""
     graph = _make_two_level_nested()
-    run = graph.stream_events({"value": "x", "items": []}, version="v3")
+    validated_input = _validate_graph_input({"value": "x", "items": []})
+    run = graph.stream_events(validated_input, version="v3")
 
     handle_paths: list[tuple[str, ...]] = []
     final_status: dict[tuple[str, ...], str] = {}
@@ -783,7 +874,8 @@ def test_stream_events_v3_real_graph_yields_subgraph_handles() -> None:
 def test_stream_events_v3_grandchild_visible_on_child_handle() -> None:
     """Drilling into `handle.subgraphs` surfaces nested grandchildren."""
     graph = _make_two_level_nested()
-    run = graph.stream_events({"value": "x", "items": []}, version="v3")
+    validated_input = _validate_graph_input({"value": "x", "items": []})
+    run = graph.stream_events(validated_input, version="v3")
 
     grandchild_paths: list[tuple[str, ...]] = []
     middle_path: tuple[str, ...] | None = None
@@ -810,7 +902,8 @@ def test_subgraph_output_stops_at_own_terminal_without_draining_siblings() -> No
     inside the loop body misses its events.
     """
     graph = _make_two_sibling_subgraphs()
-    run = graph.stream_events({"value": "x", "items": []}, version="v3")
+    validated_input = _validate_graph_input({"value": "x", "items": []})
+    run = graph.stream_events(validated_input, version="v3")
 
     paths: list[tuple[str, ...]] = []
     second_values: list[dict[str, Any]] = []
@@ -829,7 +922,8 @@ def test_subgraph_output_stops_at_own_terminal_without_draining_siblings() -> No
 
 def test_aborted_subgraph_handle_does_not_fail_parent_forwarding() -> None:
     graph = _make_two_sibling_subgraphs()
-    run = graph.stream_events({"value": "x", "items": []}, version="v3")
+    validated_input = _validate_graph_input({"value": "x", "items": []})
+    run = graph.stream_events(validated_input, version="v3")
 
     seen: list[str | None] = []
     for handle in run.subgraphs:
@@ -847,7 +941,8 @@ def test_aborted_subgraph_handle_does_not_fail_parent_forwarding() -> None:
 
 def test_failed_subgraph_output_raises_terminal_error() -> None:
     graph = _make_failing_nested()
-    run = graph.stream_events({"value": "x", "items": []}, version="v3")
+    validated_input = _validate_graph_input({"value": "x", "items": []})
+    run = graph.stream_events(validated_input, version="v3")
 
     handle = next(iter(run.subgraphs))
     with pytest.raises(RuntimeError, match="child boom"):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import binascii
 import itertools
+import re
 import sys
 import threading
 from collections import defaultdict, deque
@@ -18,8 +19,6 @@ from typing import (
     overload,
 )
 
-from langchain_core.callbacks import Callbacks
-from langchain_core.callbacks.manager import AsyncParentRunManager, ParentRunManager
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
@@ -86,8 +85,45 @@ from langgraph.types import (
     TimeoutPolicy,
 )
 
+# Inline type aliases/stubs replacing langchain_core imports
+Callbacks = Any
+ParentRunManager = Any
+AsyncParentRunManager = Any
+
 GetNextVersion = Callable[[V | None, None], V]
 SUPPORTS_EXC_NOTES = sys.version_info >= (3, 11)
+
+# Pattern for null bytes and control characters to strip from string inputs
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def _sanitize_value(val: Any) -> Any:
+    """Recursively strip null bytes and control characters from string values."""
+    if isinstance(val, str):
+        return _CONTROL_CHAR_RE.sub('', val.replace('\x00', ''))
+    elif isinstance(val, dict):
+        return {k: _sanitize_value(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [_sanitize_value(item) for item in val]
+    elif isinstance(val, tuple):
+        return tuple(_sanitize_value(item) for item in val)
+    return val
+
+
+def _sanitize_and_validate_task_input(val: Any) -> Any:
+    """Sanitize and validate input before passing to PregelExecutableTask.
+
+    Strips null bytes and control characters from string values, and validates
+    that the input is not None or empty.
+
+    Raises:
+        ValueError: If the input is None or empty.
+    """
+    if val is None:
+        raise ValueError("Task input must not be None.")
+    if isinstance(val, (dict, list, str, tuple)) and not val:
+        raise ValueError("Task input must not be empty.")
+    return _sanitize_value(val)
 
 
 class WritesProtocol(Protocol):
@@ -703,6 +739,8 @@ def prepare_single_task(
                         "metadata": metadata,
                         "tags": proc.tags,
                     }
+                    # Sanitize and validate input before passing to PregelExecutableTask
+                    val = _sanitize_and_validate_task_input(val)
                     return PregelExecutableTask(
                         name,
                         val,
@@ -890,9 +928,11 @@ def prepare_push_task_functional(
                 run_id=str(rid) if (rid := config.get("run_id")) else None,
             ),
         )
+        # Sanitize and validate input before passing to PregelExecutableTask
+        sanitized_call_input = _sanitize_and_validate_task_input(call.input)
         return PregelExecutableTask(
             name,
-            call.input,
+            sanitized_call_input,
             proc_,
             writes,
             patch_config(
@@ -1057,9 +1097,11 @@ def prepare_push_task_send(
             "metadata": metadata,
             "tags": proc.tags,
         }
+        # Sanitize and validate input before passing to PregelExecutableTask
+        sanitized_packet_arg = _sanitize_and_validate_task_input(packet.arg)
         return PregelExecutableTask(
             packet.node,
-            packet.arg,
+            sanitized_packet_arg,
             proc_node,
             writes,
             patch_config(
@@ -1198,9 +1240,11 @@ def prepare_node_error_handler_task(
         "metadata": metadata,
         "tags": proc.tags,
     }
+    # Sanitize and validate input before passing to PregelExecutableTask
+    sanitized_failed_input = _sanitize_and_validate_task_input(failed_task.input)
     return PregelExecutableTask(
         handler_node_name,
-        failed_task.input,
+        sanitized_failed_input,
         proc_node,
         writes,
         patch_config(

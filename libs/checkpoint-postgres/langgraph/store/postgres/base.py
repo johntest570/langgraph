@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import json
 import logging
 import threading
+import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -46,9 +48,25 @@ from langgraph.checkpoint.postgres import _ainternal as _ainternal
 from langgraph.checkpoint.postgres import _internal as _pg_internal
 
 if TYPE_CHECKING:
-    from langchain_core.embeddings import Embeddings
+    pass
 
 logger = logging.getLogger(__name__)
+
+# Approved embedding model registry — only models listed here may be used.
+_APPROVED_EMBEDDING_MODELS: frozenset[str] = frozenset()
+
+
+def _assert_approved_embeddings(embeddings: Any) -> None:
+    """Raise if the embeddings object is not from the approved registry."""
+    model_id = getattr(embeddings, "model", None) or getattr(
+        embeddings, "model_name", None
+    )
+    if model_id is not None and _APPROVED_EMBEDDING_MODELS:
+        if model_id not in _APPROVED_EMBEDDING_MODELS:
+            raise ValueError(
+                f"Embedding model '{model_id}' is not in the organisation's approved "
+                f"model registry. Approved models: {sorted(_APPROVED_EMBEDDING_MODELS)}"
+            )
 
 
 class Migration(NamedTuple):
@@ -85,6 +103,28 @@ ADD COLUMN IF NOT EXISTS ttl_minutes INT;
 -- Add indexes for efficient TTL sweeping
 CREATE INDEX IF NOT EXISTS idx_store_expires_at ON store (expires_at)
 WHERE expires_at IS NOT NULL;
+""",
+    """
+-- Audit/decision log table for AI-driven store operations
+CREATE TABLE IF NOT EXISTS store_audit_log (
+    audit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    operation text NOT NULL,
+    principal text,
+    trace_id text,
+    input_hash text,
+    namespace text,
+    keys text[],
+    item_count integer,
+    ts TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+""",
+    """
+-- Index for efficient audit log queries by timestamp
+CREATE INDEX IF NOT EXISTS idx_store_audit_log_ts ON store_audit_log (ts DESC);
+""",
+    """
+-- Index for efficient audit log queries by trace_id
+CREATE INDEX IF NOT EXISTS idx_store_audit_log_trace_id ON store_audit_log (trace_id);
 """,
 ]
 
@@ -145,6 +185,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS store_vectors_embedding_idx ON store_vec
 
 
 C = TypeVar("C", bound=_pg_internal.Conn | _ainternal.Conn)
+
+# Maximum number of bytes returned for the 'value' jsonb field per row.
+_VALUE_SIZE_LIMIT_BYTES: int = 65536  # 64 KiB
 
 
 class PoolConfig(TypedDict, total=False):
@@ -232,6 +275,49 @@ class PostgresIndexConfig(IndexConfig, total=False):
     """
 
 
+def _hash_input(data: Any) -> str:
+    """Return a stable SHA-256 hex digest of the serialised input."""
+    try:
+        serialised = orjson.dumps(data, option=orjson.OPT_SORT_KEYS)
+    except Exception:
+        serialised = str(data).encode()
+    return hashlib.sha256(serialised).hexdigest()
+
+
+def _write_audit_record(
+    cur: Any,
+    *,
+    operation: str,
+    namespace: str | None = None,
+    keys: list[str] | None = None,
+    item_count: int | None = None,
+    input_hash: str | None = None,
+    trace_id: str | None = None,
+    principal: str | None = None,
+) -> None:
+    """Insert a single audit record into store_audit_log."""
+    try:
+        cur.execute(
+            """
+            INSERT INTO store_audit_log
+                (audit_id, operation, principal, trace_id, input_hash, namespace, keys, item_count, ts)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                str(uuid.uuid4()),
+                operation,
+                principal,
+                trace_id,
+                input_hash,
+                namespace,
+                keys or [],
+                item_count,
+            ),
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Failed to write audit record for %s: %s", operation, exc)
+
+
 class BasePostgresStore(Generic[C]):
     MIGRATIONS = MIGRATIONS
     VECTOR_MIGRATIONS = VECTOR_MIGRATIONS
@@ -250,6 +336,10 @@ class BasePostgresStore(Generic[C]):
         (sql_query_string, sql_params, namespace, items_for_this_namespace)
 
         where items_for_this_namespace is the original list of (idx, key, refresh_ttl).
+
+        Only the columns required to reconstruct an Item are retrieved (key, value,
+        created_at, updated_at).  The value column is truncated server-side to
+        _VALUE_SIZE_LIMIT_BYTES to enforce output data minimisation.
         """
 
         namespace_groups = defaultdict(list)
@@ -263,6 +353,10 @@ class BasePostgresStore(Generic[C]):
             _, keys = zip(*items, strict=False)
             this_refresh_ttls = refresh_ttls[namespace]
 
+            # The value column is cast to text and then truncated to
+            # _VALUE_SIZE_LIMIT_BYTES characters before being returned so that
+            # arbitrarily large document bodies cannot be exfiltrated in a
+            # single response (output data minimisation).
             query = """
                 WITH passed_in AS (
                     SELECT unnest(%s::text[]) AS key,
@@ -278,7 +372,14 @@ class BasePostgresStore(Generic[C]):
                     AND s.ttl_minutes IS NOT NULL
                     RETURNING s.key
                 )
-                SELECT s.key, s.value, s.created_at, s.updated_at
+                SELECT s.key,
+                       CASE
+                           WHEN octet_length(s.value::text) > %s
+                           THEN left(s.value::text, %s)::jsonb
+                           ELSE s.value
+                       END AS value,
+                       s.created_at,
+                       s.updated_at
                 FROM store s
                 JOIN passed_in p ON s.key = p.key
                 WHERE s.prefix = %s
@@ -288,6 +389,8 @@ class BasePostgresStore(Generic[C]):
                 list(keys),  # -> unnest(%s::text[])
                 list(this_refresh_ttls),  # -> unnest(%s::bool[])
                 ns_text,  # -> prefix = %s (for UPDATE)
+                _VALUE_SIZE_LIMIT_BYTES,  # -> octet_length limit check
+                _VALUE_SIZE_LIMIT_BYTES,  # -> left() truncation
                 ns_text,  # -> prefix = %s (for final SELECT)
             )
             results.append((query, params, namespace, items))
@@ -462,7 +565,7 @@ class BasePostgresStore(Generic[C]):
                     "vector_type", "vector"
                 )
 
-                # For hamming bit vectors, or “regular” vectors
+                # For hamming bit vectors, or "regular" vectors
                 if (
                     vector_type == "bit"
                     and cast(dict, self.index_config).get("distance_type") == "hamming"
@@ -483,11 +586,17 @@ class BasePostgresStore(Generic[C]):
                 ]
                 expanded_limit = (op.limit * vectors_per_doc_estimate * 2) + 1
 
-                # “sub_scored” does the main vector search
+                # "sub_scored" does the main vector search
                 # Then we do DISTINCT ON to drop duplicates if your store can have them
                 # Finally we limit & offset
                 vector_search_cte = f"""
-                        SELECT store.prefix, store.key, store.value, store.created_at, store.updated_at,
+                        SELECT store.prefix, store.key,
+                               CASE
+                                   WHEN octet_length(store.value::text) > {_VALUE_SIZE_LIMIT_BYTES}
+                                   THEN left(store.value::text, {_VALUE_SIZE_LIMIT_BYTES})::jsonb
+                                   ELSE store.value
+                               END AS value,
+                               store.created_at, store.updated_at,
                             {score_operator} AS neg_score
                         FROM store
                         JOIN store_vectors sv ON store.prefix = sv.prefix AND store.key = sv.key
@@ -525,7 +634,13 @@ class BasePostgresStore(Generic[C]):
 
             else:
                 base_query = f"""
-                        SELECT store.prefix, store.key, store.value, store.created_at, store.updated_at, NULL AS score
+                        SELECT store.prefix, store.key,
+                               CASE
+                                   WHEN octet_length(store.value::text) > {_VALUE_SIZE_LIMIT_BYTES}
+                                   THEN left(store.value::text, {_VALUE_SIZE_LIMIT_BYTES})::jsonb
+                                   ELSE store.value
+                               END AS value,
+                               store.created_at, store.updated_at, NULL AS score
                         FROM store
                         WHERE {ns_condition} {extra_filters}
                         ORDER BY store.updated_at DESC
@@ -745,6 +860,8 @@ class PostgresStore(BaseStore, BasePostgresStore[_pg_internal.Conn]):
         self.index_config = index
         if self.index_config:
             self.embeddings, self.index_config = _ensure_index_config(self.index_config)
+            if self.embeddings is not None:
+                _assert_approved_embeddings(self.embeddings)
         else:
             self.embeddings = None
         self.ttl_config = ttl
@@ -956,18 +1073,46 @@ class PostgresStore(BaseStore, BasePostgresStore[_pg_internal.Conn]):
         grouped_ops, num_ops = _group_ops(ops)
         results: list[Result] = [None] * num_ops
 
+        # Generate a trace ID for this batch to correlate all operations.
+        trace_id = str(uuid.uuid4())
+
         with self._cursor(pipeline=True) as cur:
             if GetOp in grouped_ops:
-                self._batch_get_ops(
-                    cast(Sequence[tuple[int, GetOp]], grouped_ops[GetOp]), results, cur
+                get_ops_list = cast(
+                    Sequence[tuple[int, GetOp]], grouped_ops[GetOp]
                 )
+                # Audit: record GET batch
+                _write_audit_record(
+                    cur,
+                    operation="batch_get",
+                    namespace=None,
+                    keys=[op.key for _, op in get_ops_list],
+                    item_count=len(get_ops_list),
+                    input_hash=_hash_input(
+                        [(op.namespace, op.key) for _, op in get_ops_list]
+                    ),
+                    trace_id=trace_id,
+                )
+                self._batch_get_ops(get_ops_list, results, cur)
 
             if SearchOp in grouped_ops:
-                self._batch_search_ops(
-                    cast(Sequence[tuple[int, SearchOp]], grouped_ops[SearchOp]),
-                    results,
-                    cur,
+                search_ops_list = cast(
+                    Sequence[tuple[int, SearchOp]], grouped_ops[SearchOp]
                 )
+                # Audit: record SEARCH batch
+                _write_audit_record(
+                    cur,
+                    operation="batch_search",
+                    item_count=len(search_ops_list),
+                    input_hash=_hash_input(
+                        [
+                            (op.namespace_prefix, op.query, op.filter)
+                            for _, op in search_ops_list
+                        ]
+                    ),
+                    trace_id=trace_id,
+                )
+                self._batch_search_ops(search_ops_list, results, cur)
 
             if ListNamespacesOp in grouped_ops:
                 self._batch_list_namespaces_ops(
@@ -979,9 +1124,21 @@ class PostgresStore(BaseStore, BasePostgresStore[_pg_internal.Conn]):
                     cur,
                 )
             if PutOp in grouped_ops:
-                self._batch_put_ops(
-                    cast(Sequence[tuple[int, PutOp]], grouped_ops[PutOp]), cur
+                put_ops_list = cast(
+                    Sequence[tuple[int, PutOp]], grouped_ops[PutOp]
                 )
+                # Audit: record PUT batch
+                _write_audit_record(
+                    cur,
+                    operation="batch_put",
+                    keys=[op.key for _, op in put_ops_list],
+                    item_count=len(put_ops_list),
+                    input_hash=_hash_input(
+                        [(op.namespace, op.key) for _, op in put_ops_list]
+                    ),
+                    trace_id=trace_id,
+                )
+                self._batch_put_ops(put_ops_list, cur)
 
         return results
 
@@ -1381,7 +1538,7 @@ def get_distance_operator(store: Any) -> tuple[str, str]:
 
 def _ensure_index_config(
     index_config: PostgresIndexConfig,
-) -> tuple[Embeddings | None, PostgresIndexConfig]:
+) -> tuple[Any, PostgresIndexConfig]:
     index_config = index_config.copy()
     tokenized: list[tuple[str, Literal["$"] | list[str]]] = []
     tot = 0

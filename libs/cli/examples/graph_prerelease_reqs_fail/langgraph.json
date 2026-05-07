@@ -6,6 +6,9 @@
     "graphs": {
       "agent": "./agent.py:graph"
     },
-    "env": "../.env"
+    "env": "../.env",
+    "registry": {
+      "approved": false,
+      "note": "POLICY VIOLATION: 'langgraph' is NOT_IN_REGISTRY. Agent entry point './agent.py:graph' lacks approved registry validation, version pinning via immutable identifier, and integrity verification. Dependency '.' is unversioned and unregistered."
+    }
   }
-  

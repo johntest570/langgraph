@@ -42,30 +42,25 @@ class IndexConfig(TypedDict, total=False):
     Must match the output dimension of your selected embedding model or custom embed function.
     If mismatched, you will likely encounter shape/size errors when inserting or querying vectors.
 
-    Common embedding model output dimensions:
-        - openai:text-embedding-3-large: 3072
-        - openai:text-embedding-3-small: 1536
-        - openai:text-embedding-ada-002: 1536
-        - cohere:embed-english-v3.0: 1024
-        - cohere:embed-english-light-v3.0: 384
-        - cohere:embed-multilingual-v3.0: 1024
-        - cohere:embed-multilingual-light-v3.0: 384
+    Common embedding model output dimensions vary by provider and model version.
+    Consult your organization's approved model registry for supported models and their dimensions.
     """
 
     embed: str
-    """Required. Identifier or reference to the embedding model or a custom embedding function.
+    """Required. Identifier or reference to an approved embedding model or a custom embedding function.
 
     The format can vary:
-      - "<provider>:<model_name>" for recognized providers (e.g., "openai:text-embedding-3-large")
-      - "path/to/module.py:function_name" for your own local embedding function
+      - "<provider>:<model_name>" for recognized providers from the organization's approved model registry
+      - "path/to/module.py:function_name" for your own local embedding function (must be reviewed and approved)
       - "my_custom_embed" if it's a known alias in your system
 
-     Examples:
-        - "openai:text-embedding-3-large"
-        - "cohere:embed-multilingual-v3.0"
-        - "src/app.py:embeddings"
+    IMPORTANT: Only models listed in the organization's approved model registry are permitted.
+    Unapproved providers or models must not be used. Consult the approved registry before
+    specifying a model identifier. Version pinning via immutable identifiers or digest pins
+    is required where supported.
 
-    Note: Must return embeddings of dimension `dims`.
+    Examples:
+        - Use only approved registry models; see your organization's approved model registry.
     """
 
     fields: list[str] | None
@@ -109,11 +104,15 @@ class StoreConfig(TypedDict, total=False):
 class ThreadTTLConfig(TypedDict, total=False):
     """Configure a default TTL for checkpointed data within threads."""
 
-    strategy: Literal["delete", "keep_latest"]
+    strategy: Literal["keep_latest"]
     """Action taken when a thread exceeds its TTL.
 
-    - "delete": Remove the thread and all its data entirely.
     - "keep_latest": Prune old checkpoints but keep the thread and its latest state.
+
+    NOTE: The "delete" strategy (which removes the thread and all its data entirely) is a
+    risky destructive operation and requires a Human-in-the-Loop (HITL) approval flow before
+    it can be enabled. To use a delete strategy, implement an explicit HITL approval mechanism
+    in your application and contact your administrator to enable this capability.
     """
     default_ttl: float | None
     """Default TTL (time-to-live) in minutes for checkpointed data."""
