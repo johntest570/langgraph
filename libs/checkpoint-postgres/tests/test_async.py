@@ -14,7 +14,7 @@ from langgraph.checkpoint.base import (
     empty_checkpoint,
 )
 from langgraph.checkpoint.serde.types import TASKS
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -37,7 +37,7 @@ async def _pool_saver():
     async with await AsyncConnection.connect(
         DEFAULT_POSTGRES_URI, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
     try:
         # yield checkpointer
         async with AsyncConnectionPool(
@@ -53,7 +53,7 @@ async def _pool_saver():
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database)))
 
 
 @asynccontextmanager
@@ -64,7 +64,7 @@ async def _pipe_saver():
     async with await AsyncConnection.connect(
         DEFAULT_POSTGRES_URI, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
     try:
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI + database,
@@ -82,7 +82,7 @@ async def _pipe_saver():
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database)))
 
 
 @asynccontextmanager
@@ -93,7 +93,7 @@ async def _base_saver():
     async with await AsyncConnection.connect(
         DEFAULT_POSTGRES_URI, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
     try:
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI + database,
@@ -109,7 +109,7 @@ async def _base_saver():
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database)))
 
 
 @asynccontextmanager
@@ -120,7 +120,7 @@ async def _shallow_saver():
     async with await AsyncConnection.connect(
         DEFAULT_POSTGRES_URI, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
     try:
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI + database,
@@ -136,7 +136,7 @@ async def _shallow_saver():
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database)))
 
 
 @asynccontextmanager
