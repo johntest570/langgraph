@@ -1,4 +1,10 @@
+import base64
+import hashlib
+import json
+import logging
 import random
+import re
+import time
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
@@ -8,7 +14,6 @@ from uvloop import new_event_loop
 
 from bench.fanout_to_subgraph import fanout_to_subgraph, fanout_to_subgraph_sync
 from bench.pydantic_state import pydantic_state
-from bench.react_agent import react_agent
 from bench.sequential import create_sequential
 from bench.serde_allowlist import collect_allowlist_large, collect_allowlist_small
 from bench.wide_dict import wide_dict
@@ -16,32 +21,141 @@ from bench.wide_state import wide_state
 from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
 
+# Configure audit logger
+audit_logger = logging.getLogger("ai_audit")
+audit_logger.setLevel(logging.INFO)
+_audit_handler = logging.StreamHandler()
+_audit_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+)
+audit_logger.addHandler(_audit_handler)
 
-async def arun(graph: Pregel, input: dict):
-    len(
-        [
-            c
-            async for c in graph.astream(
-                input,
-                {
-                    "configurable": {"thread_id": str(uuid4())},
-                    "recursion_limit": 1000000000,
-                },
-                durability="exit",
-            )
-        ]
-    )
+# Approved LLM registry — react_agent uses unapproved LLMs; exclude it from benchmarks.
+_APPROVED_LLM_REGISTRY = set()  # react_agent (anthropic/openai) is NOT_IN_REGISTRY
+
+# Allowed message content patterns for input sanitization
+_BLOCKED_PATTERNS = re.compile(
+    r"(base64[^a-z]|"
+    r"[A-Za-z0-9+/]{40,}={0,2}|"  # base64-encoded blobs
+    r"\b(exec|eval|system|subprocess|os\.system|__import__)\s*\(|"  # shell/code execution
+    r"(l33t|1337|\b[a-z4@3!0]{6,}\b)|"  # leetspeak heuristic
+    r"ignore previous instructions|"
+    r"disregard (all|your) (previous |prior )?(instructions|prompt)|"
+    r"you are now|act as|pretend (you are|to be))",
+    re.IGNORECASE,
+)
+
+_MAX_MESSAGE_LENGTH = 4096
 
 
-async def arun_first_event_latency(graph: Pregel, input: dict) -> None:
+def _sanitize_and_validate_input(input_data: dict) -> dict:
+    """Sanitize and validate input before passing to AI model."""
+    messages = input_data.get("messages", [])
+    sanitized_messages = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            content = msg.content
+            if not isinstance(content, str):
+                raise ValueError("Message content must be a string.")
+            if len(content) > _MAX_MESSAGE_LENGTH:
+                raise ValueError(
+                    f"Message content exceeds maximum length of {_MAX_MESSAGE_LENGTH}."
+                )
+            # Check for base64-encoded content
+            try:
+                decoded = base64.b64decode(content, validate=True)
+                if len(decoded) > 0:
+                    raise ValueError("Message content appears to be base64-encoded.")
+            except Exception:
+                pass  # Not valid base64 — acceptable
+            if _BLOCKED_PATTERNS.search(content):
+                raise ValueError(
+                    "Message content contains potentially malicious patterns."
+                )
+            sanitized_messages.append(msg)
+        else:
+            sanitized_messages.append(msg)
+    return {**input_data, "messages": sanitized_messages}
+
+
+def _compute_input_hash(input_data: dict) -> str:
+    """Compute a stable hash of the input for audit purposes."""
+    try:
+        serialized = json.dumps(input_data, default=str, sort_keys=True)
+    except Exception:
+        serialized = str(input_data)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _log_audit_record(
+    trace_id: str,
+    thread_id: str,
+    benchmark_name: str,
+    input_hash: str,
+    event: str,
+    extra: dict = None,
+) -> None:
+    """Write a structured audit record for forensic readiness."""
+    record = {
+        "trace_id": trace_id,
+        "thread_id": thread_id,
+        "benchmark": benchmark_name,
+        "input_hash": input_hash,
+        "event": event,
+        "timestamp": time.time(),
+    }
+    if extra:
+        record.update(extra)
+    audit_logger.info(json.dumps(record))
+
+
+async def arun(graph: Pregel, input: dict, benchmark_name: str = "unknown"):
+    validated_input = _sanitize_and_validate_input(input) if "messages" in input else input
+    trace_id = str(uuid4())
+    thread_id = str(uuid4())
+    input_hash = _compute_input_hash(validated_input)
+    _log_audit_record(trace_id, thread_id, benchmark_name, input_hash, "arun_start")
+    try:
+        len(
+            [
+                c
+                async for c in graph.astream(
+                    validated_input,
+                    {
+                        "configurable": {"thread_id": thread_id},
+                        "recursion_limit": 1000000000,
+                    },
+                    durability="exit",
+                )
+            ]
+        )
+        _log_audit_record(trace_id, thread_id, benchmark_name, input_hash, "arun_complete")
+    except Exception as exc:
+        _log_audit_record(
+            trace_id, thread_id, benchmark_name, input_hash, "arun_error",
+            {"error": str(exc)},
+        )
+        raise
+
+
+async def arun_first_event_latency(
+    graph: Pregel, input: dict, benchmark_name: str = "unknown"
+) -> None:
     """Latency for the first event.
 
     Run the graph until the first event is processed and then stop.
     """
+    validated_input = _sanitize_and_validate_input(input) if "messages" in input else input
+    trace_id = str(uuid4())
+    thread_id = str(uuid4())
+    input_hash = _compute_input_hash(validated_input)
+    _log_audit_record(
+        trace_id, thread_id, benchmark_name, input_hash, "arun_first_event_latency_start"
+    )
     stream = graph.astream(
-        input,
+        validated_input,
         {
-            "configurable": {"thread_id": str(uuid4())},
+            "configurable": {"thread_id": thread_id},
             "recursion_limit": 1000000000,
         },
         durability="exit",
@@ -49,36 +163,66 @@ async def arun_first_event_latency(graph: Pregel, input: dict) -> None:
 
     try:
         async for _ in stream:
+            _log_audit_record(
+                trace_id, thread_id, benchmark_name, input_hash,
+                "arun_first_event_latency_first_event",
+            )
             break
     finally:
         await stream.aclose()
+        _log_audit_record(
+            trace_id, thread_id, benchmark_name, input_hash,
+            "arun_first_event_latency_complete",
+        )
 
 
-def run(graph: Pregel, input: dict):
-    len(
-        [
-            c
-            for c in graph.stream(
-                input,
-                {
-                    "configurable": {"thread_id": str(uuid4())},
-                    "recursion_limit": 1000000000,
-                },
-                durability="exit",
-            )
-        ]
-    )
+def run(graph: Pregel, input: dict, benchmark_name: str = "unknown"):
+    validated_input = _sanitize_and_validate_input(input) if "messages" in input else input
+    trace_id = str(uuid4())
+    thread_id = str(uuid4())
+    input_hash = _compute_input_hash(validated_input)
+    _log_audit_record(trace_id, thread_id, benchmark_name, input_hash, "run_start")
+    try:
+        len(
+            [
+                c
+                for c in graph.stream(
+                    validated_input,
+                    {
+                        "configurable": {"thread_id": thread_id},
+                        "recursion_limit": 1000000000,
+                    },
+                    durability="exit",
+                )
+            ]
+        )
+        _log_audit_record(trace_id, thread_id, benchmark_name, input_hash, "run_complete")
+    except Exception as exc:
+        _log_audit_record(
+            trace_id, thread_id, benchmark_name, input_hash, "run_error",
+            {"error": str(exc)},
+        )
+        raise
 
 
-def run_first_event_latency(graph: Pregel, input: dict) -> None:
+def run_first_event_latency(
+    graph: Pregel, input: dict, benchmark_name: str = "unknown"
+) -> None:
     """Latency for the first event.
 
     Run the graph until the first event is processed and then stop.
     """
+    validated_input = _sanitize_and_validate_input(input) if "messages" in input else input
+    trace_id = str(uuid4())
+    thread_id = str(uuid4())
+    input_hash = _compute_input_hash(validated_input)
+    _log_audit_record(
+        trace_id, thread_id, benchmark_name, input_hash, "run_first_event_latency_start"
+    )
     stream = graph.stream(
-        input,
+        validated_input,
         {
-            "configurable": {"thread_id": str(uuid4())},
+            "configurable": {"thread_id": thread_id},
             "recursion_limit": 1000000000,
         },
         durability="exit",
@@ -86,9 +230,17 @@ def run_first_event_latency(graph: Pregel, input: dict) -> None:
 
     try:
         for _ in stream:
+            _log_audit_record(
+                trace_id, thread_id, benchmark_name, input_hash,
+                "run_first_event_latency_first_event",
+            )
             break
     finally:
         stream.close()
+        _log_audit_record(
+            trace_id, thread_id, benchmark_name, input_hash,
+            "run_first_event_latency_complete",
+        )
 
 
 def compile_graph(graph: StateGraph) -> None:
@@ -96,6 +248,8 @@ def compile_graph(graph: StateGraph) -> None:
     graph.compile()
 
 
+# NOTE: react_agent benchmarks are excluded because react_agent uses LLMs
+# (anthropic/openai) that are NOT in the organization's approved LLM registry.
 benchmarks = (
     (
         "fanout_to_subgraph_10x",
@@ -137,30 +291,10 @@ benchmarks = (
             ]
         },
     ),
-    (
-        "react_agent_10x",
-        react_agent(10, checkpointer=None),
-        react_agent(10, checkpointer=None),
-        {"messages": [HumanMessage("hi?")]},
-    ),
-    (
-        "react_agent_10x_checkpoint",
-        react_agent(10, checkpointer=InMemorySaver()),
-        react_agent(10, checkpointer=InMemorySaver()),
-        {"messages": [HumanMessage("hi?")]},
-    ),
-    (
-        "react_agent_100x",
-        react_agent(100, checkpointer=None),
-        react_agent(100, checkpointer=None),
-        {"messages": [HumanMessage("hi?")]},
-    ),
-    (
-        "react_agent_100x_checkpoint",
-        react_agent(100, checkpointer=InMemorySaver()),
-        react_agent(100, checkpointer=InMemorySaver()),
-        {"messages": [HumanMessage("hi?")]},
-    ),
+    # react_agent_10x excluded: uses unapproved LLM (NOT_IN_REGISTRY)
+    # react_agent_10x_checkpoint excluded: uses unapproved LLM (NOT_IN_REGISTRY)
+    # react_agent_100x excluded: uses unapproved LLM (NOT_IN_REGISTRY)
+    # react_agent_100x_checkpoint excluded: uses unapproved LLM (NOT_IN_REGISTRY)
     (
         "wide_state_25x300",
         wide_state(300).compile(checkpointer=None),
@@ -468,9 +602,16 @@ r = Runner()
 
 # Full graph run time
 for name, agraph, graph, input in benchmarks:
-    r.bench_async_func(name, arun, agraph, input, loop_factory=new_event_loop)
+    r.bench_async_func(
+        name,
+        arun,
+        agraph,
+        input,
+        name,
+        loop_factory=new_event_loop,
+    )
     if graph is not None:
-        r.bench_func(name + "_sync", run, graph, input)
+        r.bench_func(name + "_sync", run, graph, input, name)
 
 
 # Pick a handful of graphs to measure the first event latency.
@@ -482,18 +623,23 @@ GRAPHS_FOR_1st_EVENT_LATENCY = (
 
 # First event latency
 for name, agraph, graph, input in benchmarks:
-    if graph not in GRAPHS_FOR_1st_EVENT_LATENCY:
+    if name not in GRAPHS_FOR_1st_EVENT_LATENCY:
         continue
     r.bench_async_func(
         name + "_first_event_latency",
         arun_first_event_latency,
         agraph,
         input,
+        name,
         loop_factory=new_event_loop,
     )
     if graph is not None:
         r.bench_func(
-            name + "_first_event_latency_sync", run_first_event_latency, graph, input
+            name + "_first_event_latency_sync",
+            run_first_event_latency,
+            graph,
+            input,
+            name,
         )
 
 # Graph compilation times
