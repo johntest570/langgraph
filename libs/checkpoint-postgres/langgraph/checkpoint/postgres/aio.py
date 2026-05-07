@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import logging
+import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -35,6 +38,20 @@ from langgraph.checkpoint.postgres.base import (
 from langgraph.checkpoint.postgres.shallow import AsyncShallowPostgresSaver
 
 Conn = _ainternal.Conn  # For backward compatibility
+
+logger = logging.getLogger(__name__)
+
+
+def _audit_log(action: str, details: dict[str, Any]) -> None:
+    """Emit a structured audit log entry for forensic readiness."""
+    entry = {
+        "audit": True,
+        "action": action,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "trace_id": str(uuid.uuid4()),
+        **details,
+    }
+    logger.info("AUDIT: %s", entry)
 
 
 class AsyncPostgresSaver(BasePostgresSaver):
@@ -94,27 +111,32 @@ class AsyncPostgresSaver(BasePostgresSaver):
         already exist and runs database migrations. It MUST be called directly by the user
         the first time checkpointer is used.
         """
-        async with self._cursor() as cur:
-            await cur.execute(self.MIGRATIONS[0])
-            results = await cur.execute(
-                "SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1"
-            )
-            row = await results.fetchone()
-            if row is None:
-                version = -1
-            else:
-                version = row["v"]
-            for v, migration in zip(
-                range(version + 1, len(self.MIGRATIONS)),
-                self.MIGRATIONS[version + 1 :],
-                strict=False,
-            ):
-                await cur.execute(migration)
-                await cur.execute(
-                    "INSERT INTO checkpoint_migrations (v) VALUES (%s)", (v,)
+        try:
+            async with self._cursor() as cur:
+                await cur.execute(self.MIGRATIONS[0])
+                results = await cur.execute(
+                    "SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1"
                 )
-        if self.pipe:
-            await self.pipe.sync()
+                row = await results.fetchone()
+                if row is None:
+                    version = -1
+                else:
+                    version = row["v"]
+                for v, migration in zip(
+                    range(version + 1, len(self.MIGRATIONS)),
+                    self.MIGRATIONS[version + 1 :],
+                    strict=False,
+                ):
+                    await cur.execute(migration)
+                    await cur.execute(
+                        "INSERT INTO checkpoint_migrations (v) VALUES (%s)", (v,)
+                    )
+            if self.pipe:
+                await self.pipe.sync()
+            _audit_log("setup", {"status": "success"})
+        except Exception as exc:
+            _audit_log("setup", {"status": "failure", "error": str(exc)})
+            raise
 
     async def alist(
         self,
@@ -277,31 +299,55 @@ class AsyncPostgresSaver(BasePostgresSaver):
             else:
                 blob_values[k] = copy["channel_values"].pop(k)
 
-        async with self._cursor(pipeline=True) as cur:
-            if blob_versions := {
-                k: v for k, v in new_versions.items() if k in blob_values
-            }:
-                await cur.executemany(
-                    self.UPSERT_CHECKPOINT_BLOBS_SQL,
-                    await asyncio.to_thread(
-                        self._dump_blobs,
+        try:
+            async with self._cursor(pipeline=True) as cur:
+                if blob_versions := {
+                    k: v for k, v in new_versions.items() if k in blob_values
+                }:
+                    await cur.executemany(
+                        self.UPSERT_CHECKPOINT_BLOBS_SQL,
+                        await asyncio.to_thread(
+                            self._dump_blobs,
+                            thread_id,
+                            checkpoint_ns,
+                            blob_values,
+                            blob_versions,
+                        ),
+                    )
+                await cur.execute(
+                    self.UPSERT_CHECKPOINTS_SQL,
+                    (
                         thread_id,
                         checkpoint_ns,
-                        blob_values,
-                        blob_versions,
+                        checkpoint["id"],
+                        checkpoint_id,
+                        Jsonb(copy),
+                        Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
                     ),
                 )
-            await cur.execute(
-                self.UPSERT_CHECKPOINTS_SQL,
-                (
-                    thread_id,
-                    checkpoint_ns,
-                    checkpoint["id"],
-                    checkpoint_id,
-                    Jsonb(copy),
-                    Jsonb(get_serializable_checkpoint_metadata(config, metadata)),
-                ),
+            _audit_log(
+                "aput",
+                {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": checkpoint_ns,
+                    "checkpoint_id": checkpoint["id"],
+                    "parent_checkpoint_id": checkpoint_id,
+                    "status": "success",
+                },
             )
+        except Exception as exc:
+            _audit_log(
+                "aput",
+                {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": checkpoint_ns,
+                    "checkpoint_id": checkpoint["id"],
+                    "parent_checkpoint_id": checkpoint_id,
+                    "status": "failure",
+                    "error": str(exc),
+                },
+            )
+            raise
         return next_config
 
     async def aput_writes(
@@ -334,31 +380,100 @@ class AsyncPostgresSaver(BasePostgresSaver):
             task_path,
             writes,
         )
-        async with self._cursor(pipeline=True) as cur:
-            await cur.executemany(query, params)
+        try:
+            async with self._cursor(pipeline=True) as cur:
+                await cur.executemany(query, params)
+            _audit_log(
+                "aput_writes",
+                {
+                    "thread_id": config["configurable"]["thread_id"],
+                    "checkpoint_ns": config["configurable"]["checkpoint_ns"],
+                    "checkpoint_id": config["configurable"]["checkpoint_id"],
+                    "task_id": task_id,
+                    "task_path": task_path,
+                    "num_writes": len(list(writes)),
+                    "status": "success",
+                },
+            )
+        except Exception as exc:
+            _audit_log(
+                "aput_writes",
+                {
+                    "thread_id": config["configurable"]["thread_id"],
+                    "checkpoint_ns": config["configurable"]["checkpoint_ns"],
+                    "checkpoint_id": config["configurable"]["checkpoint_id"],
+                    "task_id": task_id,
+                    "task_path": task_path,
+                    "status": "failure",
+                    "error": str(exc),
+                },
+            )
+            raise
 
-    async def adelete_thread(self, thread_id: str) -> None:
+    async def adelete_thread(self, thread_id: str, *, approved: bool = False) -> None:
         """Delete all checkpoints and writes associated with a thread ID.
+
+        This is a destructive operation. Human-in-the-Loop (HITL) approval is required.
+        Callers MUST pass `approved=True` to confirm the deletion has been reviewed and
+        approved by a human operator before proceeding.
 
         Args:
             thread_id: The thread ID to delete.
+            approved: Must be set to True by a human operator to confirm the deletion.
 
         Returns:
             None
+
+        Raises:
+            PermissionError: If `approved` is not True.
         """
-        async with self._cursor(pipeline=True) as cur:
-            await cur.execute(
-                "DELETE FROM checkpoints WHERE thread_id = %s",
-                (str(thread_id),),
+        if not approved:
+            raise PermissionError(
+                "Human-in-the-Loop approval is required before deleting a thread. "
+                "A human operator must review and confirm this deletion by passing "
+                "`approved=True` to adelete_thread()."
             )
-            await cur.execute(
-                "DELETE FROM checkpoint_blobs WHERE thread_id = %s",
-                (str(thread_id),),
+        _audit_log(
+            "adelete_thread",
+            {
+                "thread_id": thread_id,
+                "approved": approved,
+                "status": "initiated",
+            },
+        )
+        try:
+            async with self._cursor(pipeline=True) as cur:
+                await cur.execute(
+                    "DELETE FROM checkpoints WHERE thread_id = %s",
+                    (str(thread_id),),
+                )
+                await cur.execute(
+                    "DELETE FROM checkpoint_blobs WHERE thread_id = %s",
+                    (str(thread_id),),
+                )
+                await cur.execute(
+                    "DELETE FROM checkpoint_writes WHERE thread_id = %s",
+                    (str(thread_id),),
+                )
+            _audit_log(
+                "adelete_thread",
+                {
+                    "thread_id": thread_id,
+                    "approved": approved,
+                    "status": "success",
+                },
             )
-            await cur.execute(
-                "DELETE FROM checkpoint_writes WHERE thread_id = %s",
-                (str(thread_id),),
+        except Exception as exc:
+            _audit_log(
+                "adelete_thread",
+                {
+                    "thread_id": thread_id,
+                    "approved": approved,
+                    "status": "failure",
+                    "error": str(exc),
+                },
             )
+            raise
 
     @asynccontextmanager
     async def _cursor(
@@ -655,15 +770,29 @@ class AsyncPostgresSaver(BasePostgresSaver):
             self.aput_writes(config, writes, task_id, task_path), self.loop
         ).result()
 
-    def delete_thread(self, thread_id: str) -> None:
+    def delete_thread(self, thread_id: str, *, approved: bool = False) -> None:
         """Delete all checkpoints and writes associated with a thread ID.
+
+        This is a destructive operation. Human-in-the-Loop (HITL) approval is required.
+        Callers MUST pass `approved=True` to confirm the deletion has been reviewed and
+        approved by a human operator before proceeding.
 
         Args:
             thread_id: The thread ID to delete.
+            approved: Must be set to True by a human operator to confirm the deletion.
 
         Returns:
             None
+
+        Raises:
+            PermissionError: If `approved` is not True.
         """
+        if not approved:
+            raise PermissionError(
+                "Human-in-the-Loop approval is required before deleting a thread. "
+                "A human operator must review and confirm this deletion by passing "
+                "`approved=True` to delete_thread()."
+            )
         try:
             # check if we are in the main thread, only bg threads can block
             # we don't check in other methods to avoid the overhead
@@ -677,7 +806,7 @@ class AsyncPostgresSaver(BasePostgresSaver):
         except RuntimeError:
             pass
         return asyncio.run_coroutine_threadsafe(
-            self.adelete_thread(thread_id), self.loop
+            self.adelete_thread(thread_id, approved=approved), self.loop
         ).result()
 
 
