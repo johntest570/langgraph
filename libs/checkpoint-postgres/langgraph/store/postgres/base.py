@@ -804,12 +804,64 @@ class PostgresStore(BaseStore, BasePostgresStore[_pg_internal.Conn]):
                 else:
                     yield cls(conn, index=index, ttl=ttl)
 
-    def sweep_ttl(self) -> int:
+        def sweep_ttl(
+        self,
+        hitl_approval_callback: "Optional[Callable[[], bool]]" = None,
+    ) -> int:
         """Delete expired store items based on TTL.
 
+        A Human-in-the-Loop (HITL) approval step is required before any
+        DELETE operation is executed.  Supply ``hitl_approval_callback`` at
+        call-time, or set ``self.hitl_approval_callback`` on the instance.
+        The callable must return ``True`` to authorise the deletion; any
+        other return value or exception will abort the sweep.
+
+        Args:
+            hitl_approval_callback: Optional callable that returns ``True``
+                when a human operator has approved the deletion.  Falls back
+                to ``self.hitl_approval_callback`` if not provided.
+
         Returns:
-            int: The number of deleted items.
+            int: The number of deleted items (0 if approval was denied).
         """
+        # Resolve the approval callback: prefer the argument, then the
+        # instance attribute, then the class-level default (None).
+        approval_fn = (
+            hitl_approval_callback
+            or getattr(self, "hitl_approval_callback", None)
+        )
+
+        # --- HITL gate ---------------------------------------------------
+        # A DELETE is a destructive, irreversible operation.  We require
+        # explicit human approval before proceeding.
+        if approval_fn is None:
+            logger.warning(
+                "sweep_ttl: no HITL approval callback configured. "
+                "Skipping DELETE to protect data. "
+                "Set hitl_approval_callback on the store instance or pass "
+                "it as an argument to authorise TTL sweeps."
+            )
+            return 0
+
+        try:
+            approved = approval_fn()
+        except Exception as exc:
+            logger.error(
+                "sweep_ttl: HITL approval callback raised an exception – "
+                "aborting DELETE for safety.",
+                exc_info=exc,
+            )
+            return 0
+
+        if not approved:
+            logger.warning(
+                "sweep_ttl: HITL approval was denied. "
+                "Skipping DELETE of expired store items."
+            )
+            return 0
+        # -----------------------------------------------------------------
+
+        logger.info("sweep_ttl: HITL approval granted – proceeding with DELETE.")
         with self._cursor() as cur:
             cur.execute(
                 """
