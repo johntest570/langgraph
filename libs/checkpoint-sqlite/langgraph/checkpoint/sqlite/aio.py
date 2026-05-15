@@ -6,7 +6,7 @@ import random
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, TypeVar, cast
+from typing import Any, Optional, TypeVar, cast
 
 import aiosqlite
 from langchain_core.runnables import RunnableConfig
@@ -110,14 +110,16 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
 
     def __init__(
         self,
-        conn: aiosqlite.Connection,
-        *,
-        serde: SerializerProtocol | None = None,
+            conn: aiosqlite.Connection
+    serde: SerializerProtocol
+    hitl_approval: Optional[Callable[[str, str], Any]] | None = None,
     ):
         super().__init__(serde=serde)
         self.jsonplus_serde = JsonPlusSerializer()
-        self.conn = conn
+                self.conn = conn
+        self.serde = serde if serde is not None else JsonPlusSerializer()
         self.lock = asyncio.Lock()
+        self.hitl_approval: Optional[Callable[[str, str], Any]] = None
         self.loop = asyncio.get_running_loop()
         self.is_setup = False
 
@@ -609,6 +611,28 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
         next_v = current_v + 1
         next_h = random.random()
         return f"{next_v:032}.{next_h:016}"
+
+
+async def _default_hitl_approval(operation: str, details: str) -> bool:
+    """Default HITL approval function that prompts the user via stdin.
+
+    Args:
+        operation: The name of the risky operation (e.g. 'DELETE').
+        details: Human-readable description of what will be affected.
+
+    Returns:
+        True if the operator approves, False otherwise.
+    """
+    loop = asyncio.get_event_loop()
+    prompt = (
+        f"[HITL APPROVAL REQUIRED] Operation: {operation}\n"
+        f"Details: {details}\n"
+        "Type 'yes' to approve or anything else to deny: "
+    )
+    response = await loop.run_in_executor(
+        None, lambda: input(prompt).strip().lower()
+    )
+    return response == "yes"
 
 
 async def _ensure_connected(conn: aiosqlite.Connection) -> None:
