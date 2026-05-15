@@ -1157,6 +1157,17 @@ class SyncRunsClient:
             ```
 
         """
+        # HITL approval flow: require explicit human confirmation before destructive delete operation
+        confirmation = input(
+            f"[HITL Approval Required] You are about to DELETE run '{run_id}' "
+            f"from thread '{thread_id}'. This action is irreversible. "
+            f"Type 'yes' to confirm: "
+        ).strip().lower()
+        if confirmation != "yes":
+            raise PermissionError(
+                f"Delete operation for run '{run_id}' on thread '{thread_id}' "
+                "was not approved by the human operator. Aborting."
+            )
         self.http.delete(
             f"/threads/{thread_id}/runs/{run_id}", headers=headers, params=params
         )
