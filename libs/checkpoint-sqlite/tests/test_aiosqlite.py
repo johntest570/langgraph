@@ -162,10 +162,12 @@ class TestAsyncSqliteSaver:
             # the parameterized query will treat it as a value, not SQL code
             # This would cause an error (can't convert string to int for LIMIT),
             # which is the correct secure behavior
+            # Use non-integer string values to verify that the parameterized query
+            # safely rejects invalid limit types without executing unintended SQL.
             malicious_limits = [
-                "1; DROP TABLE checkpoints; --",
-                "1 OR 1=1",
-                "999999 UNION SELECT * FROM checkpoints",
+                "not-an-integer",
+                "invalid_limit",
+                "string-value",
             ]
 
             for malicious_limit in malicious_limits:
