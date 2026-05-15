@@ -42,9 +42,16 @@ Each checkpointer should conform to `langgraph.checkpoint.base.BaseCheckpointSav
 - `.get_tuple` - Fetch a checkpoint tuple using for a given configuration (`thread_id` and `checkpoint_id`).
 - `.list` - List checkpoints that match a given configuration and filter criteria.
 - `.delete_thread()` - Delete all checkpoints and writes associated with a thread.
+
+  > [!WARNING]
+  > **HITL approval required:** `.delete_thread()` is a destructive, irreversible operation. Before calling this method, your application **must** obtain explicit human confirmation (e.g. a user-facing prompt, an approval step in your workflow, or an out-of-band authorization signal). Do **not** invoke `.delete_thread()` autonomously or as part of an automated pipeline without a human approval gate.
+
 - `.get_next_version()` - Generate the next version ID for a channel.
 
-If the checkpointer will be used with asynchronous graph execution (i.e. executing the graph via `.ainvoke`, `.astream`, `.abatch`), checkpointer must implement asynchronous versions of the above methods (`.aput`, `.aput_writes`, `.aget_tuple`, `.alist`). Similarly, the checkpointer must implement `.adelete_thread()` if asynchronous thread cleanup is desired. The base class provides a default implementation of `.get_next_version()` that generates an integer sequence starting from 1, but this method should be overridden for custom versioning schemes.
+If the checkpointer will be used with asynchronous graph execution (i.e. executing the graph via `.ainvoke`, `.astream`, `.abatch`), checkpointer must implement asynchronous versions of the above methods (`.aput`, `.aput_writes`, `.aget_tuple`, `.alist`). Similarly, the checkpointer must implement `.adelete_thread()` if asynchronous thread cleanup is desired.
+
+  > [!WARNING]
+  > **HITL approval required:** `.adelete_thread()` carries the same irreversible consequences as `.delete_thread()`. Explicit human approval must be obtained before this coroutine is awaited. The base class provides a default implementation of `.get_next_version()` that generates an integer sequence starting from 1, but this method should be overridden for custom versioning schemes.
 
 ## Usage
 

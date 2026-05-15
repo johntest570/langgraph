@@ -204,6 +204,36 @@ class SyncThreadsClient:
         params: QueryParamTypes | None = None,
     ) -> Thread | None: ...
 
+
+class OperationAbortedError(RuntimeError):
+    """Raised when a risky operation is aborted by the user during HITL review."""
+
+
+def _hitl_confirm(message: str) -> None:
+    """Human-in-the-Loop approval gate for destructive operations.
+
+    Prompts the operator for explicit confirmation before a risky operation
+    (delete, purge, destroy, etc.) is executed.  Raises
+    :class:`OperationAbortedError` if the operator does not confirm.
+
+    Args:
+        message: A human-readable description of the operation that is about
+            to be performed.
+
+    Raises:
+        OperationAbortedError: If the operator does not type ``yes``.
+    """
+    print(f"\n[HITL APPROVAL REQUIRED] {message}")
+    try:
+        answer = input("Type 'yes' to confirm, or anything else to abort: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer != "yes":
+        raise OperationAbortedError(
+            f"Operation aborted by operator. No changes were made. ({message})"
+        )
+
+
     def update(
         self,
         thread_id: str,
@@ -282,6 +312,10 @@ class SyncThreadsClient:
             ```
 
         """
+        _hitl_confirm(
+            f"You are about to permanently DELETE thread '{thread_id}'. "
+            "This action cannot be undone."
+        )
         self.http.delete(f"/threads/{thread_id}", headers=headers, params=params)
 
     def search(

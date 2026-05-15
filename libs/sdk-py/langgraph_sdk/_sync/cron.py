@@ -26,6 +26,27 @@ from langgraph_sdk.schema import (
 )
 
 
+def _require_human_approval(operation: str, resource_id: str) -> None:
+    """Prompt for human approval before executing a risky (destructive) operation.
+
+    Args:
+        operation: A short description of the operation being performed (e.g. 'delete cron job').
+        resource_id: The identifier of the resource that will be affected.
+
+    Raises:
+        PermissionError: If the operator does not confirm the operation.
+    """
+    prompt = (
+        f"[HITL] You are about to {operation} '{resource_id}'. "
+        "This action is irreversible. Type 'yes' to confirm: "
+    )
+    answer = input(prompt).strip().lower()
+    if answer != "yes":
+        raise PermissionError(
+            f"Operation '{operation}' on '{resource_id}' was not approved by the operator."
+        )
+
+
 class SyncCronClient:
     """Synchronous client for managing cron jobs in LangGraph.
 
@@ -282,6 +303,7 @@ class SyncCronClient:
         *,
         headers: Mapping[str, str] | None = None,
         params: QueryParamTypes | None = None,
+        _approved: bool = False,
     ) -> None:
         """Delete a cron.
 

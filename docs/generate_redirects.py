@@ -83,11 +83,25 @@ def generate_redirects():
     with open(script_dir / "redirects.json") as f:
         redirects = json.load(f)
 
-    # Clean output directory
+    # Clean output directory — remove only known HTML redirect files, not the whole tree
     if output_dir.exists():
-        import shutil
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True)
+        for old_path in redirects.keys():
+            path = old_path.lstrip("/")
+            path_obj = Path(path)
+            has_extension = path_obj.suffix and len(path_obj.suffix) <= 5
+            if not path:
+                candidate = output_dir / "index.html"
+            elif has_extension:
+                candidate = output_dir / path
+            else:
+                candidate = output_dir / path / "index.html"
+            if candidate.exists() and candidate.is_file():
+                candidate.unlink()
+        for extra in ["index.html", "404.html"]:
+            candidate = output_dir / extra
+            if candidate.exists() and candidate.is_file():
+                candidate.unlink()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate individual HTML files for each redirect
     for old_path, new_url in redirects.items():

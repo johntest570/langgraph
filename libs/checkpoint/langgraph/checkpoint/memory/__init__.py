@@ -647,29 +647,82 @@ class PersistentDict(defaultdict):
 
     """
 
-    def __init__(self, *args: Any, filename: str, **kwds: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        filename: str,
+        hitl_approver: Any = None,
+        **kwds: Any,
+    ) -> None:
         self.flag = "c"  # r=readonly, c=create, or n=new
         self.mode = None  # None or an octal triple like 0644
         self.format = "pickle"  # 'csv', 'json', or 'pickle'
         self.filename = filename
+        # hitl_approver: optional callable(operation: str, details: dict) -> bool
+        # Must return True to allow the destructive operation to proceed.
+        # If None, a default interactive prompt is used.
+        self.hitl_approver = hitl_approver
         super().__init__(*args, **kwds)
+
+    def _require_approval(self, operation: str, details: dict) -> None:
+        """Enforce HITL approval before executing a destructive file operation.
+
+        Args:
+            operation: A short label for the operation (e.g. 'remove', 'move').
+            details: A dict with context about the operation.
+
+        Raises:
+            PermissionError: If the approver denies the operation.
+        """
+        if self.hitl_approver is not None:
+            approved = self.hitl_approver(operation, details)
+        else:
+            # Default: interactive console prompt for human approval.
+            prompt = (
+                f"[HITL] Approve destructive operation '{operation}' "
+                f"with details {details}? [yes/no]: "
+            )
+            response = input(prompt).strip().lower()
+            approved = response in ("yes", "y")
+        if not approved:
+            raise PermissionError(
+                f"HITL approval denied for operation '{operation}' "
+                f"on file '{self.filename}'. Details: {details}"
+            )
+
+    @staticmethod
+    def _safe_path(path: str, base_dir: str) -> str:
+        """Resolve path and ensure it stays within base_dir."""
+        if "\x00" in path:
+            raise ValueError("Path contains null bytes")
+        resolved = os.path.realpath(os.path.abspath(path))
+        resolved_base = os.path.realpath(os.path.abspath(base_dir))
+        if not resolved.startswith(resolved_base + os.sep) and resolved != resolved_base:
+            raise ValueError(
+                f"Path '{resolved}' is outside the allowed directory '{resolved_base}'"
+            )
+        return resolved
 
     def sync(self) -> None:
         "Write dict to disk"
         if self.flag == "r":
             return
-        tempname = self.filename + ".tmp"
+        base_dir = os.path.dirname(os.path.abspath(self.filename)) or os.getcwd()
+        safe_filename = self._safe_path(self.filename, base_dir)
+        tempname = safe_filename + ".tmp"
         fileobj = open(tempname, "wb" if self.format == "pickle" else "w")
         try:
             self.dump(fileobj)
         except Exception:
-            os.remove(tempname)
+            safe_tempname = self._safe_path(tempname, base_dir)
+            os.remove(safe_tempname)
             raise
         finally:
             fileobj.close()
-        shutil.move(tempname, self.filename)  # atomic commit
+        safe_tempname = self._safe_path(tempname, base_dir)
+        shutil.move(safe_tempname, safe_filename)  # atomic commit
         if self.mode is not None:
-            os.chmod(self.filename, self.mode)
+            os.chmod(safe_filename, self.mode)
 
     def close(self) -> None:
         self.sync()

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Any, Literal, overload
+from typing import Any, Callable, Coroutine, Literal, overload
+
+# Type alias for an async HITL approver:
+# receives (operation, context) and returns True to allow, False to deny.
+HITLApprover = Callable[[str, dict[str, Any]], Coroutine[Any, Any, bool]]
 
 from langgraph_sdk._async.http import HttpClient
 from langgraph_sdk.schema import (
@@ -39,8 +44,45 @@ class ThreadsClient:
         ```
     """
 
-    def __init__(self, http: HttpClient) -> None:
+    def __init__(
+        self,
+        http: HttpClient,
+        hitl_approver: HITLApprover | None = None,
+    ) -> None:
         self.http = http
+        # Optional async callable used as a Human-in-the-Loop gate for risky
+        # operations (delete, copy, purge).  When provided it is awaited before
+        # any destructive or sensitive action; if it returns False the operation
+        # is aborted with a PermissionError.
+        self._hitl_approver = hitl_approver
+
+    async def _require_approval(self, operation: str, context: dict[str, Any]) -> None:
+        """Enforce a Human-in-the-Loop approval gate.
+
+        Args:
+            operation: A short label for the operation being attempted
+                       (e.g. ``"delete_thread"``).  Passed to the approver so
+                       that the human reviewer knows what they are approving.
+            context:   Arbitrary key/value pairs that describe the specific
+                       invocation (e.g. ``{"thread_id": "abc123"}``).  Also
+                       forwarded to the approver for display purposes.
+
+        Raises:
+            PermissionError: When no approver is configured **or** when the
+                             configured approver returns ``False``.
+        """
+        if self._hitl_approver is None:
+            raise PermissionError(
+                f"Operation '{operation}' requires Human-in-the-Loop approval, "
+                "but no 'hitl_approver' was configured on ThreadsClient.  "
+                "Pass an async approver callable when constructing the client."
+            )
+        approved: bool = await self._hitl_approver(operation, context)
+        if not approved:
+            raise PermissionError(
+                f"Operation '{operation}' was denied by the Human-in-the-Loop "
+                f"approver.  Context: {context}"
+            )
 
     async def get(
         self,

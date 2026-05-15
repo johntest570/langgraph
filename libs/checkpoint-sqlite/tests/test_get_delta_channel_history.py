@@ -20,8 +20,11 @@ Scenarios covered:
 
 from __future__ import annotations
 
+import logging
 import operator
 from typing import Annotated, Any
+
+logger = logging.getLogger(__name__)
 
 import pytest
 from langchain_core.runnables import RunnableConfig
@@ -68,12 +71,16 @@ def _delta_graph(checkpointer: Any) -> Any:
 
 def _drive(graph: Any, config: RunnableConfig, n: int) -> None:
     for i in range(n):
-        graph.invoke({"items": [f"v{i}"]}, config)
+        logger.info("LLM interaction: graph.invoke called with items=[v%s], config=%s", i, config)
+        result = graph.invoke({"items": [f"v{i}"]}, config)
+        logger.info("LLM interaction: graph.invoke completed with result=%s", result)
 
 
 async def _adrive(graph: Any, config: RunnableConfig, n: int) -> None:
     for i in range(n):
-        await graph.ainvoke({"items": [f"v{i}"]}, config)
+        logger.info("LLM interaction: graph.ainvoke called with items=[v%s], config=%s", i, config)
+        result = await graph.ainvoke({"items": [f"v{i}"]}, config)
+        logger.info("LLM interaction: graph.ainvoke completed with result=%s", result)
 
 
 def _pick_non_root(saver: Any, config: RunnableConfig) -> RunnableConfig:

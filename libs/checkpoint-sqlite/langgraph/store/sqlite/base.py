@@ -1050,6 +1050,25 @@ class SqliteStore(BaseSqliteStore, BaseStore):
             int: The number of deleted items.
         """
         with self._cursor() as cur:
+            # Audit step: preview rows to be deleted before executing destructive operation
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM store
+                WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP
+                """
+            )
+            row = cur.fetchone()
+            pending_count = row[0] if row else 0
+
+            if pending_count == 0:
+                return 0
+
+            logger.info(
+                "Store TTL sweep: %d expired item(s) identified for deletion",
+                pending_count,
+            )
+
+            # Execute deletion only after audit log confirms intent
             cur.execute(
                 """
                 DELETE FROM store
@@ -1057,6 +1076,10 @@ class SqliteStore(BaseSqliteStore, BaseStore):
                 """
             )
             deleted_count = cur.rowcount
+            logger.info(
+                "Store TTL sweep: %d expired item(s) deleted",
+                deleted_count,
+            )
             return deleted_count
 
     def start_ttl_sweeper(

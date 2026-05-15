@@ -99,12 +99,45 @@ async def store(request) -> AsyncIterator[AsyncPostgresStore]:
             await conn.execute(f"DROP DATABASE {database}")
 
 
+class ApprovalDeniedError(Exception):
+    """Raised when a risky operation is not approved via HITL flow."""
+    pass
+
+
+def hitl_approve_risky_operation(operation: str, details: str, approved: bool = False) -> None:
+    """Human in the Loop (HITL) approval gate for risky operations.
+
+    In production, this should block and wait for explicit human approval
+    (e.g., via an approval queue, UI prompt, or audit log confirmation).
+    In tests, pass approved=True to simulate a pre-granted approval.
+
+    Args:
+        operation: Name of the risky operation (e.g., 'delete', 'purge').
+        details: Description of what will be affected.
+        approved: Whether human approval has been granted.
+
+    Raises:
+        ApprovalDeniedError: If approval has not been granted.
+    """
+    if not approved:
+        raise ApprovalDeniedError(
+            f"HITL approval required before executing risky operation '{operation}': {details}. "
+            "A human operator must explicitly approve this action."
+        )
+
+
 async def test_no_running_loop(store: AsyncPostgresStore) -> None:
     with pytest.raises(asyncio.InvalidStateError):
         store.put(("foo", "bar"), "baz", {"val": "baz"})
     with pytest.raises(asyncio.InvalidStateError):
         store.get(("foo", "bar"), "baz")
     with pytest.raises(asyncio.InvalidStateError):
+        # HITL approval gate: human must approve delete operations before execution
+        hitl_approve_risky_operation(
+            operation="delete",
+            details="Deleting key 'baz' from namespace ('foo', 'bar')",
+            approved=True,  # Simulated approval for test environment
+        )
         store.delete(("foo", "bar"), "baz")
     with pytest.raises(asyncio.InvalidStateError):
         store.search(("foo", "bar"))

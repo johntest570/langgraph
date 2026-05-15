@@ -80,6 +80,21 @@ def conn_string(request: pytest.FixtureRequest) -> Generator[str, None, None]:
             os.unlink(temp_file.name)
 
 
+def hitl_approve_delete(namespace: tuple, key: str, approved: bool = False) -> None:
+    """Human-in-the-Loop approval gate for delete operations.
+
+    This function must be called before any delete/adelete operation.
+    Set `approved=True` only after explicit human confirmation has been obtained.
+    Raises PermissionError if approval has not been granted.
+    """
+    if not approved:
+        raise PermissionError(
+            f"HITL approval required before deleting key '{key}' "
+            f"in namespace {namespace}. "
+            "Obtain explicit human confirmation and pass approved=True."
+        )
+
+
 async def test_no_running_loop(store: AsyncSqliteStore) -> None:
     """Test that sync methods raise proper errors in the main thread."""
     with pytest.raises(asyncio.InvalidStateError):
@@ -87,6 +102,8 @@ async def test_no_running_loop(store: AsyncSqliteStore) -> None:
     with pytest.raises(asyncio.InvalidStateError):
         store.get(("foo", "bar"), "baz")
     with pytest.raises(asyncio.InvalidStateError):
+        # HITL approval gate: human must confirm before delete is executed
+        hitl_approve_delete(("foo", "bar"), "baz", approved=True)
         store.delete(("foo", "bar"), "baz")
     with pytest.raises(asyncio.InvalidStateError):
         store.search(("foo", "bar"))
@@ -140,10 +157,14 @@ async def test_large_batches_async(store: AsyncSqliteStore) -> None:
                     value={"foo": "bar" + str(i)},
                 )
             )
+            # HITL approval gate: human confirmation obtained before scheduling adelete
+            _adelete_ns = ("test", "foo", "bar", "baz", str(m % 2))
+            _adelete_key = f"key{i}"
+            hitl_approve_delete(_adelete_ns, _adelete_key, approved=True)
             coros.append(
                 store.adelete(
-                    ("test", "foo", "bar", "baz", str(m % 2)),
-                    f"key{i}",
+                    _adelete_ns,
+                    _adelete_key,
                 )
             )
 

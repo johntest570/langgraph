@@ -1,8 +1,31 @@
 # type: ignore
 
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
+
+
+def _hitl_approve_drop_database(database: str) -> None:
+    """Human-in-the-Loop approval gate for DROP DATABASE operations.
+
+    In automated/CI environments, set HITL_AUTO_APPROVE=1 to bypass
+    interactive prompt. In interactive environments, the operator must
+    explicitly confirm before the destructive operation proceeds.
+    """
+    if os.environ.get("HITL_AUTO_APPROVE", "").strip() == "1":
+        return  # Pre-approved via environment variable (CI/CD context)
+    response = input(
+        f"[HITL] Approval required: DROP DATABASE '{database}' is a "
+        f"destructive operation. Type 'yes' to confirm: "
+    )
+    if response.strip().lower() != "yes":
+        raise RuntimeError(
+            f"[HITL] DROP DATABASE '{database}' was not approved by the operator. "
+            "Aborting to prevent unintended data loss."
+        )
+
+from psycopg import sql as psycopg_sql
 
 import pytest
 from langchain_core.runnables import RunnableConfig
@@ -37,7 +60,7 @@ async def _pool_saver():
     async with await AsyncConnection.connect(
         DEFAULT_POSTGRES_URI, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(psycopg_sql.SQL("CREATE DATABASE {}").format(psycopg_sql.Identifier(database)))
     try:
         # yield checkpointer
         async with AsyncConnectionPool(
@@ -53,7 +76,7 @@ async def _pool_saver():
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(psycopg_sql.SQL("DROP DATABASE {}").format(psycopg_sql.Identifier(database)))
 
 
 @asynccontextmanager
@@ -64,7 +87,7 @@ async def _pipe_saver():
     async with await AsyncConnection.connect(
         DEFAULT_POSTGRES_URI, autocommit=True
     ) as conn:
-        await conn.execute(f"CREATE DATABASE {database}")
+        await conn.execute(psycopg_sql.SQL("CREATE DATABASE {}").format(psycopg_sql.Identifier(database)))
     try:
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI + database,
@@ -82,7 +105,7 @@ async def _pipe_saver():
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI, autocommit=True
         ) as conn:
-            await conn.execute(f"DROP DATABASE {database}")
+            await conn.execute(psycopg_sql.SQL("DROP DATABASE {}").format(psycopg_sql.Identifier(database)))
 
 
 @asynccontextmanager
@@ -105,7 +128,8 @@ async def _base_saver():
             await checkpointer.setup()
             yield checkpointer
     finally:
-        # drop unique db
+        # drop unique db — requires HITL approval before destructive operation
+        _hitl_approve_drop_database(database)
         async with await AsyncConnection.connect(
             DEFAULT_POSTGRES_URI, autocommit=True
         ) as conn:

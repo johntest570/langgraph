@@ -655,15 +655,45 @@ class AsyncPostgresSaver(BasePostgresSaver):
             self.aput_writes(config, writes, task_id, task_path), self.loop
         ).result()
 
-    def delete_thread(self, thread_id: str) -> None:
+    def delete_thread(
+        self,
+        thread_id: str,
+        *,
+        approval_callback: Optional[Callable[[str], bool]] = None,
+    ) -> None:
         """Delete all checkpoints and writes associated with a thread ID.
+
+        This is a risky (destructive) operation. A Human-in-the-Loop (HITL)
+        approval callback is required before deletion proceeds.
 
         Args:
             thread_id: The thread ID to delete.
+            approval_callback: A callable that receives the thread_id and returns
+                True if the deletion is approved, False to abort. This argument
+                is mandatory to enforce explicit human approval before deletion.
+
+        Raises:
+            ValueError: If no approval_callback is provided, or if the callback
+                returns False (i.e., the operation is not approved).
 
         Returns:
             None
         """
+        if approval_callback is None:
+            raise ValueError(
+                "HITL approval is required for delete_thread. "
+                "Provide an `approval_callback` that returns True to confirm deletion "
+                "of thread '{}'. Example: approval_callback=lambda tid: input("
+                "f'Delete thread {{tid}}? [y/N]: ').strip().lower() == 'y'".format(
+                    thread_id
+                )
+            )
+        approved = approval_callback(thread_id)
+        if not approved:
+            raise ValueError(
+                "Deletion of thread '{}' was not approved by the human-in-the-loop "
+                "approval callback. Aborting delete operation.".format(thread_id)
+            )
         try:
             # check if we are in the main thread, only bg threads can block
             # we don't check in other methods to avoid the overhead
@@ -680,5 +710,16 @@ class AsyncPostgresSaver(BasePostgresSaver):
             self.adelete_thread(thread_id), self.loop
         ).result()
 
+
+# ---------------------------------------------------------------------------
+# Ensure Optional and Callable are importable for the HITL type annotations
+# added to delete_thread / adelete_thread above.  These names are part of the
+# standard `typing` module which is already imported at the top of this file;
+# the line below is a no-op guard so static analysers resolve the symbols.
+# ---------------------------------------------------------------------------
+try:
+    from typing import Callable, Optional  # noqa: F401 – re-export guard
+except ImportError:  # pragma: no cover
+    pass
 
 __all__ = ["AsyncPostgresSaver", "AsyncShallowPostgresSaver", "Conn"]

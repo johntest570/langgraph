@@ -15,6 +15,12 @@ from langgraph_cli.progress import Progress
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# Allowed docker compose sub-commands (explicit allowlist — do not interpolate user input here)
+_COMPOSE_UP_ARGS: tuple[str, ...] = ("up", "--remove-orphans", "--wait")
+_COMPOSE_DOWN_ARGS: tuple[str, ...] = ("down", "-v", "--remove-orphans")
+_COMPOSE_LOGS_ARGS: tuple[str, ...] = ("logs", "langgraph-api")
+_COMPOSE_PS_ARGS: tuple[str, ...] = ("ps",)
+
 
 def test(config: pathlib.Path, port: int, tag: str, verbose: bool):
     """Spin up API with Postgres/Redis via docker compose and wait until ready."""
@@ -41,7 +47,7 @@ def test(config: pathlib.Path, port: int, tag: str, verbose: bool):
         )
 
         # Compose up with wait (implies detach), similar to `langgraph up --wait`
-        args_up = [*args, "up", "--remove-orphans", "--wait"]
+        args_up = [*args, *_COMPOSE_UP_ARGS]
 
         compose_cmd = ["docker", "compose"]
         if capabilities.compose_type == "standalone":
@@ -63,7 +69,7 @@ def test(config: pathlib.Path, port: int, tag: str, verbose: bool):
             try:
                 sys.stderr.write("\n== docker compose ps ==\n")
                 runner.run(
-                    subp_exec(*compose_cmd, *args, "ps", input=stdin, verbose=True)
+                    subp_exec(*compose_cmd, *args, *_COMPOSE_PS_ARGS, input=stdin, verbose=True)
                 )
             except Exception:
                 pass
@@ -73,8 +79,7 @@ def test(config: pathlib.Path, port: int, tag: str, verbose: bool):
                     subp_exec(
                         *compose_cmd,
                         *args,
-                        "logs",
-                        "langgraph-api",
+                        *_COMPOSE_LOGS_ARGS,
                         input=stdin,
                         verbose=True,
                     )
@@ -87,9 +92,7 @@ def test(config: pathlib.Path, port: int, tag: str, verbose: bool):
                         subp_exec(
                             *compose_cmd,
                             *args,
-                            "down",
-                            "-v",
-                            "--remove-orphans",
+                            *_COMPOSE_DOWN_ARGS,
                             input=stdin,
                             verbose=False,
                         )
