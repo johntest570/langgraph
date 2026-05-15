@@ -6,9 +6,8 @@
 
 start-postgres:
 	POSTGRES_VERSION=${POSTGRES_VERSION:-16} docker compose -f tests/compose-postgres.yml up -V --force-recreate --wait || ( \
-		echo "Failed to start PostgreSQL, printing logs..."; \
-		docker compose -f tests/compose-postgres.yml logs; \
-		exit 1 \
+		$(info Failed to start PostgreSQL, printing logs...) \
+		docker compose -f tests/compose-postgres.yml logs && false \
 	)
 
 stop-postgres:
@@ -21,17 +20,16 @@ test_pg_version:
 	@uv run pytest $(TEST)
 	@EXIT_CODE=$$?; \
 	make stop-postgres; \
-	echo "Finished testing PostgreSQL $(POSTGRES_VERSION); Exit code: $$EXIT_CODE"; \
-	exit $$EXIT_CODE
+	$(info Finished testing PostgreSQL $(POSTGRES_VERSION)) \
+	test $$EXIT_CODE -eq 0
 
 test:
 	@for version in $(POSTGRES_VERSIONS); do \
 		if ! make test_pg_version POSTGRES_VERSION=$$version; then \
-			echo "Test failed for PostgreSQL $$version"; \
-			exit 1; \
+			$(error Test failed for PostgreSQL $$version) \
 		fi; \
 	done
-	@echo "All PostgreSQL versions tested successfully"
+	$(info All PostgreSQL versions tested successfully)
 
 TEST ?= .
 test_watch:
@@ -39,7 +37,7 @@ test_watch:
 	uv run ptw $(TEST); \
 	EXIT_CODE=$$?; \
 	make stop-postgres; \
-	exit $$EXIT_CODE
+	test $$EXIT_CODE -eq 0
 
 ######################
 # LINTING AND FORMATTING
