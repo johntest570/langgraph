@@ -1,5 +1,8 @@
 import functools
+import logging
 from typing import Annotated, Any, Callable, Dict, List, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 from langchain_community.adapters.openai import convert_message_to_dict
 from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage
@@ -43,14 +46,30 @@ def create_simulated_user(
     Returns:
         Runnable[Dict, AIMessage]: The simulated user for chatbot simulation.
     """
-    return ChatPromptTemplate.from_messages(
+    _llm = (llm or ChatOpenAI(model="gpt-3.5-turbo")).with_config(
+        run_name="simulated_user"
+    )
+    prompt = ChatPromptTemplate.from_messages(
         [
             ("system", system_prompt),
             MessagesPlaceholder(variable_name="messages"),
         ]
-    ) | (llm or ChatOpenAI(model="gpt-3.5-turbo")).with_config(
-        run_name="simulated_user"
     )
+
+    def _logged_simulated_user(input_dict: Dict) -> AIMessage:
+        logger.info(
+            "[LLM INTERACTION] simulated_user invoked | input: %s",
+            input_dict,
+        )
+        formatted = prompt.invoke(input_dict)
+        response = _llm.invoke(formatted)
+        logger.info(
+            "[LLM INTERACTION] simulated_user response | output: %s",
+            response,
+        )
+        return response
+
+    return RunnableLambda(_logged_simulated_user)
 
 
 Messages = Union[list[AnyMessage], AnyMessage]
@@ -150,7 +169,15 @@ def _invoke_simulated_user(state: SimulationState, simulated_user: Runnable):
     )
     inputs = state.get("inputs", {})
     inputs["messages"] = state["messages"]
-    return runnable.invoke(inputs)
+    result = runnable.invoke(inputs)
+    # Validate the simulated user LLM output for dangerous code execution primitives.
+    if isinstance(result, str):
+        _validate_llm_output(result, source="Simulated user LLM")
+    elif isinstance(result, BaseMessage):
+        content = result.content
+        if isinstance(content, str):
+            _validate_llm_output(content, source="Simulated user LLM")
+    return result
 
 
 def _swap_roles(state: SimulationState):
@@ -185,10 +212,57 @@ def _create_simulated_user_node(simulated_user: Runnable):
     )
 
 
+_DANGEROUS_PRIMITIVES = [
+    r"\beval\s*\(",
+    r"\bexec\s*\(",
+    r"\bcompile\s*\(",
+    r"\b__import__\s*\(",
+    r"\bexecfile\s*\(",
+    r"\bgetattr\s*\(.*__",
+    r"\bsetattr\s*\(.*__",
+    r"\bdelattr\s*\(.*__",
+    r"\b__builtins__\b",
+    r"\bglobals\s*\(\s*\)",
+    r"\blocals\s*\(\s*\)",
+    r"\bvars\s*\(\s*\)",
+    r"\bsubprocess\b",
+    r"\bos\.system\s*\(",
+    r"\bos\.popen\s*\(",
+]
+
+
+def _validate_llm_output(content: str, source: str = "LLM") -> str:
+    """Validate LLM output for dangerous dynamic code execution primitives.
+
+    Args:
+        content: The string content to validate.
+        source: A label indicating the source of the output (for error messages).
+
+    Returns:
+        The original content if no dangerous primitives are found.
+
+    Raises:
+        ValueError: If the content contains a dangerous dynamic code execution primitive.
+    """
+    import re
+
+    for pattern in _DANGEROUS_PRIMITIVES:
+        if re.search(pattern, content, re.IGNORECASE):
+            raise ValueError(
+                f"{source} output contains a forbidden dynamic code execution "
+                f"primitive matching pattern '{pattern}'. Output rejected for safety."
+            )
+    return content
+
+
 def _coerce_to_message(assistant_output: str | BaseMessage):
     if isinstance(assistant_output, str):
+        _validate_llm_output(assistant_output, source="Assistant LLM")
         return {"messages": [AIMessage(content=assistant_output)]}
     else:
+        content = assistant_output.content
+        if isinstance(content, str):
+            _validate_llm_output(content, source="Assistant LLM")
         return {"messages": [assistant_output]}
 
 
