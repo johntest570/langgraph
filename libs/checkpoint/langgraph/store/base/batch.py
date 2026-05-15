@@ -60,11 +60,15 @@ class AsyncBatchedBaseStore(BaseStore):
 
     __slots__ = ("_loop", "_aqueue", "_task")
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        hitl_approval_callback: Callable[[tuple[str, ...], str], Any] | None = None,
+    ) -> None:
         super().__init__()
         self._loop = asyncio.get_running_loop()
         self._aqueue: asyncio.Queue[tuple[asyncio.Future, Op]] = asyncio.Queue()
         self._task: asyncio.Task | None = None
+        self._hitl_approval_callback = hitl_approval_callback
         self._ensure_task()
 
     def __del__(self) -> None:
@@ -155,6 +159,14 @@ class AsyncBatchedBaseStore(BaseStore):
         namespace: tuple[str, ...],
         key: str,
     ) -> None:
+        if self._hitl_approval_callback is not None:
+            approved = await self._hitl_approval_callback(namespace, key)
+            if not approved:
+                raise PermissionError(
+                    f"HITL approval denied for delete operation on "
+                    f"namespace={namespace!r}, key={key!r}. "
+                    "The delete was rejected by the human-in-the-loop approval flow."
+                )
         self._ensure_task()
         fut = self._loop.create_future()
         self._aqueue.put_nowait((fut, PutOp(namespace, key, None)))
