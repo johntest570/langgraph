@@ -7,6 +7,32 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, tzinfo
 from typing import Any
 
+
+def _hitl_confirm(prompt: str) -> None:
+    """Human-in-the-Loop confirmation gate for destructive operations.
+
+    Prompts the operator for explicit approval before proceeding.
+    Raises PermissionError if the operator does not confirm.
+
+    Args:
+        prompt: A description of the operation requiring approval.
+
+    Raises:
+        PermissionError: If the operator declines or provides non-affirmative input.
+    """
+    print(f"[HITL APPROVAL REQUIRED] {prompt}")
+    try:
+        answer = input("Type 'yes' to confirm or anything else to abort: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raise PermissionError(
+            f"HITL approval aborted for operation: {prompt}"
+        )
+    if answer != "yes":
+        raise PermissionError(
+            f"HITL approval denied for operation: {prompt}. "
+            "Destructive operation was not confirmed by the operator."
+        )
+
 from langgraph_sdk._async.http import HttpClient
 from langgraph_sdk._shared.utilities import _resolve_timezone
 from langgraph_sdk.schema import (
