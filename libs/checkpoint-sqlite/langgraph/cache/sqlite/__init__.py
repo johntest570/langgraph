@@ -61,7 +61,14 @@ class SqliteCache(BaseCache[ValueT]):
             rows = cursor.fetchall()
             for ns, key, expiry, encoding, raw in rows:
                 if expiry is not None and now > expiry:
-                    # purge expired entry
+                    # purge expired entry — requires HITL approval
+                    operation = {
+                        "action": "DELETE",
+                        "reason": "purge expired entry",
+                        "target": {"ns": ns, "key": key},
+                    }
+                    if not self._hitl_approve(operation):
+                        continue
                     self._conn.execute(
                         "DELETE FROM cache WHERE (ns, key) = (?, ?)", (ns, key)
                     )
@@ -97,7 +104,24 @@ class SqliteCache(BaseCache[ValueT]):
 
     def clear(self, namespaces: Sequence[Namespace] | None = None) -> None:
         """Delete the cached values for the given namespaces.
-        If no namespaces are provided, clear all cached values."""
+        If no namespaces are provided, clear all cached values.
+        Requires HITL approval before executing any DELETE."""
+        if namespaces is None:
+            operation = {
+                "action": "DELETE",
+                "reason": "clear all cached values",
+                "target": "ALL",
+            }
+        else:
+            operation = {
+                "action": "DELETE",
+                "reason": "clear cached values for namespaces",
+                "target": [list(ns) for ns in namespaces],
+            }
+        if not self._hitl_approve(operation):
+            raise PermissionError(
+                f"HITL approval denied for cache DELETE operation: {operation}"
+            )
         with self._lock, self._conn:
             if namespaces is None:
                 self._conn.execute("DELETE FROM cache")
@@ -110,8 +134,33 @@ class SqliteCache(BaseCache[ValueT]):
 
     async def aclear(self, namespaces: Sequence[Namespace] | None = None) -> None:
         """Asynchronously delete the cached values for the given namespaces.
-        If no namespaces are provided, clear all cached values."""
+        If no namespaces are provided, clear all cached values.
+        Requires HITL approval (delegated to `clear`) before executing any DELETE."""
         await asyncio.to_thread(self.clear, namespaces)
+
+    # ---------------------------------------------------------------------------
+    # HITL (Human-in-the-Loop) approval helper
+    # ---------------------------------------------------------------------------
+    def _hitl_approve(self, operation: dict) -> bool:
+        """Call the registered approval callback for a risky DELETE operation.
+
+        The callback receives a dict describing the operation and must return
+        ``True`` to allow it or ``False`` to deny it.  If no callback is
+        registered the operation is **denied by default** so that callers must
+        explicitly opt in.
+
+        Register a callback via ``instance.hitl_approval_callback = my_fn``
+        or pass ``hitl_approval_callback`` to the constructor.
+        """
+        callback = getattr(self, "hitl_approval_callback", None)
+        if callback is None:
+            raise PermissionError(
+                "No HITL approval callback is registered. "
+                "Set `instance.hitl_approval_callback = <callable>` that "
+                "returns True to permit DELETE operations, or False to deny them. "
+                f"Blocked operation: {operation}"
+            )
+        return bool(callback(operation))
 
     def __del__(self) -> None:
         try:
