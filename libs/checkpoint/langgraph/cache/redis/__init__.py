@@ -111,15 +111,62 @@ class RedisCache(BaseCache[ValueT]):
         """Asynchronously set the cached values for the given keys and TTLs."""
         self.set(mapping)
 
+        @staticmethod
+    def _hitl_confirm(operation_description: str) -> bool:
+        """Human-in-the-Loop confirmation prompt for destructive operations.
+        Returns True only if the user explicitly confirms with 'yes'."""
+        import sys
+        import warnings
+
+        warnings.warn(
+            f"[HITL] Destructive operation requested: {operation_description}",
+            stacklevel=3,
+        )
+        try:
+            if not sys.stdin.isatty():
+                # Non-interactive environment — deny by default
+                warnings.warn(
+                    "[HITL] Non-interactive environment detected. "
+                    "Destructive operation DENIED. "
+                    "Provide explicit approval to proceed.",
+                    stacklevel=3,
+                )
+                return False
+            response = input(
+                f"[HITL] You are about to perform a destructive Redis cache operation: "
+                f"{operation_description}\n"
+                "Type 'yes' to confirm, anything else to cancel: "
+            ).strip().lower()
+            approved = response == "yes"
+            if not approved:
+                warnings.warn(
+                    f"[HITL] Destructive operation CANCELLED by user: {operation_description}",
+                    stacklevel=3,
+                )
+            return approved
+        except (EOFError, OSError):
+            warnings.warn(
+                "[HITL] Could not obtain user confirmation. "
+                "Destructive operation DENIED.",
+                stacklevel=3,
+            )
+            return False
+
     def clear(self, namespaces: Sequence[Namespace] | None = None) -> None:
         """Delete the cached values for the given namespaces.
-        If no namespaces are provided, clear all cached values."""
+        If no namespaces are provided, clear all cached values.
+        Requires Human-in-the-Loop (HITL) approval before executing."""
         try:
             if namespaces is None:
                 # Clear all keys with our prefix
                 pattern = f"{self.prefix}*"
                 keys = self.redis.keys(pattern)
                 if keys:
+                    operation_desc = (
+                        f"DELETE ALL {len(keys)} key(s) matching pattern '{pattern}'"
+                    )
+                    if not self._hitl_confirm(operation_desc):
+                        return
                     self.redis.delete(*keys)
             else:
                 # Clear specific namespaces
@@ -133,6 +180,15 @@ class RedisCache(BaseCache[ValueT]):
                     keys_to_delete.extend(keys)
 
                 if keys_to_delete:
+                    ns_labels = ", ".join(
+                        ":".join(ns) if ns else "(root)" for ns in namespaces
+                    )
+                    operation_desc = (
+                        f"DELETE {len(keys_to_delete)} key(s) "
+                        f"for namespace(s): {ns_labels}"
+                    )
+                    if not self._hitl_confirm(operation_desc):
+                        return
                     self.redis.delete(*keys_to_delete)
         except Exception:
             # Silently fail if Redis is unavailable
@@ -140,5 +196,6 @@ class RedisCache(BaseCache[ValueT]):
 
     async def aclear(self, namespaces: Sequence[Namespace] | None = None) -> None:
         """Asynchronously delete the cached values for the given namespaces.
-        If no namespaces are provided, clear all cached values."""
+        If no namespaces are provided, clear all cached values.
+        Requires Human-in-the-Loop (HITL) approval before executing."""
         self.clear(namespaces)
