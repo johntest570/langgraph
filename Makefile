@@ -8,11 +8,11 @@ all: lint format lock test
 # Install dependencies for all projects
 .PHONY: install
 install:
-	@echo "Creating virtual environment..."
+	@printf 'Creating virtual environment...\n'
 	@uv venv
 	@for dir in $(LIBS_DIRS); do \
 		if [ -f $$dir/pyproject.toml ]; then \
-			echo "Installing dependencies for $$dir"; \
+			@printf 'Installing dependencies for %s\n' "$$dir"; \
 			uv pip install -e $$dir; \
 		fi; \
 	done
@@ -22,7 +22,7 @@ install:
 lint:
 	@for dir in $(LIBS_DIRS); do \
 		if [ -f $$dir/Makefile ]; then \
-			echo "Running lint in $$dir"; \
+			@printf 'Running lint in %s\n' "$$dir"; \
 			$(MAKE) -C $$dir lint; \
 		fi; \
 	done
@@ -32,7 +32,7 @@ lint:
 format:
 	@for dir in $(LIBS_DIRS); do \
 		if [ -f $$dir/Makefile ]; then \
-			echo "Running format in $$dir"; \
+			@printf 'Running format in %s\n' "$$dir"; \
 			$(MAKE) -C $$dir format; \
 		fi; \
 	done
@@ -42,7 +42,7 @@ format:
 lock:
 	@for dir in $(LIBS_DIRS); do \
 		if [ -f $$dir/Makefile ]; then \
-			echo "Running lock in $$dir"; \
+			@printf 'Running lock in %s\n' "$$dir"; \
 			(cd $$dir && uv lock); \
 		fi; \
 	done
@@ -52,7 +52,7 @@ lock:
 lock-upgrade:
 	@for dir in $(LIBS_DIRS); do \
 		if [ -f $$dir/Makefile ]; then \
-			echo "Running lock-upgrade in $$dir"; \
+			@printf 'Running lock-upgrade in %s\n' "$$dir"; \
 			(cd $$dir && uv lock --upgrade); \
 		fi; \
 	done
@@ -62,7 +62,7 @@ lock-upgrade:
 test:
 	@for dir in $(LIBS_DIRS); do \
 		if [ -f $$dir/Makefile ]; then \
-			echo "Running test in $$dir"; \
+			@printf 'Running test in %s\n' "$$dir"; \
 			$(MAKE) -C $$dir test; \
 		fi; \
 	done
