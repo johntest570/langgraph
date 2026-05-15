@@ -1176,6 +1176,23 @@ class RunsClient:
             ```
 
         """
+        # HITL approval flow: require explicit human confirmation before executing a destructive DELETE operation
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        confirmation = await loop.run_in_executor(
+            None,
+            input,
+            f"[HITL Approval Required] You are about to DELETE run '{run_id}' "
+            f"from thread '{thread_id}'. This action is irreversible. "
+            f"Type 'yes' to confirm: ",
+        )
+        if confirmation.strip().lower() != "yes":
+            raise PermissionError(
+                f"HITL approval denied: DELETE operation for run '{run_id}' "
+                f"on thread '{thread_id}' was not confirmed by the user."
+            )
+
         await self.http.delete(
             f"/threads/{thread_id}/runs/{run_id}", headers=headers, params=params
         )
