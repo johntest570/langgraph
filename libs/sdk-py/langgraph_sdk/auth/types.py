@@ -1070,9 +1070,38 @@ class on:
             value = AssistantsUpdate
 
         class delete:
-            """Type for assistant deletion parameters."""
+            """Type for assistant deletion parameters.
+
+            WARNING: This is a destructive operation and requires HITL approval.
+            Call `on.assistants.delete.approve()` before executing this operation.
+            """
 
             value = AssistantsDelete
+            requires_approval: bool = True
+            _approved: bool = False
+
+            @classmethod
+            def approve(cls) -> None:
+                """Human-in-the-loop approval gate for assistant deletion.
+
+                Must be explicitly called by an authorized human operator
+                before the delete operation is permitted to proceed.
+                """
+                cls._approved = True
+
+            @classmethod
+            def check_approval(cls) -> None:
+                """Verify that HITL approval has been granted.
+
+                Raises:
+                    HITLApprovalRequired: If approval has not been granted.
+                """
+                if cls.requires_approval and not cls._approved:
+                    raise HITLApprovalRequired(
+                        "Human-in-the-loop approval is required before deleting "
+                        "an assistant. Call on.assistants.delete.approve() first."
+                    )
+                cls._approved = False  # Reset after check (one-time approval)
 
         class search:
             """Type for assistant search parameters."""
@@ -1100,9 +1129,38 @@ class on:
             value = CronsUpdate
 
         class delete:
-            """Type for cron deletion parameters."""
+            """Type for cron deletion parameters.
+
+            WARNING: This is a destructive operation and requires HITL approval.
+            Call `on.crons.delete.approve()` before executing this operation.
+            """
 
             value = CronsDelete
+            requires_approval: bool = True
+            _approved: bool = False
+
+            @classmethod
+            def approve(cls) -> None:
+                """Human-in-the-loop approval gate for cron deletion.
+
+                Must be explicitly called by an authorized human operator
+                before the delete operation is permitted to proceed.
+                """
+                cls._approved = True
+
+            @classmethod
+            def check_approval(cls) -> None:
+                """Verify that HITL approval has been granted.
+
+                Raises:
+                    HITLApprovalRequired: If approval has not been granted.
+                """
+                if cls.requires_approval and not cls._approved:
+                    raise HITLApprovalRequired(
+                        "Human-in-the-loop approval is required before deleting "
+                        "a cron job. Call on.crons.delete.approve() first."
+                    )
+                cls._approved = False  # Reset after check (one-time approval)
 
         class search:
             """Type for cron search parameters."""
@@ -1130,9 +1188,38 @@ class on:
             value = StoreSearch
 
         class delete:
-            """Type for store delete parameters."""
+            """Type for store delete parameters.
+
+            WARNING: This is a destructive operation and requires HITL approval.
+            Call `on.store.delete.approve()` before executing this operation.
+            """
 
             value = StoreDelete
+            requires_approval: bool = True
+            _approved: bool = False
+
+            @classmethod
+            def approve(cls) -> None:
+                """Human-in-the-loop approval gate for store deletion.
+
+                Must be explicitly called by an authorized human operator
+                before the delete operation is permitted to proceed.
+                """
+                cls._approved = True
+
+            @classmethod
+            def check_approval(cls) -> None:
+                """Verify that HITL approval has been granted.
+
+                Raises:
+                    HITLApprovalRequired: If approval has not been granted.
+                """
+                if cls.requires_approval and not cls._approved:
+                    raise HITLApprovalRequired(
+                        "Human-in-the-loop approval is required before deleting "
+                        "a store entry. Call on.store.delete.approve() first."
+                    )
+                cls._approved = False  # Reset after check (one-time approval)
 
         class list_namespaces:
             """Type for store list namespaces parameters."""
@@ -1140,9 +1227,24 @@ class on:
             value = StoreListNamespaces
 
 
+class HITLApprovalRequired(Exception):
+    """Raised when a destructive operation is attempted without HITL approval.
+
+    All delete/purge/destroy operations require explicit human-in-the-loop
+    approval before they can proceed. Call the corresponding `.approve()`
+    classmethod on the operation type to grant approval.
+
+    Example::
+
+        on.assistants.delete.approve()   # human operator grants approval
+        on.assistants.delete.check_approval()  # passes, then resets
+    """
+
+
 __all__ = [
     "AssistantsCreate",
     "AssistantsDelete",
+    "HITLApprovalRequired",
     "AssistantsRead",
     "AssistantsSearch",
     "AssistantsUpdate",
